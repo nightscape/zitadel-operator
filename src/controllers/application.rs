@@ -570,6 +570,9 @@ async fn reconcile(app: Arc<Application>, ctx: Arc<OperatorContext>) -> Result<A
                             ).await.map_err(|e| Error::Other(format!("failed to discover OIDC provider metadata: {:?}", e)))?;
 
                             let mut secret_data = BTreeMap::new();
+                            secret_data.insert("zitadel_organization_id".to_string(), proj.organization_id.clone());
+                            secret_data.insert("zitadel_project_id".to_string(), proj.id.clone());
+                            secret_data.insert("zitadel_application_id".to_string(), resp.app_id.clone());
                             secret_data.insert("client_id".to_string(), resp.client_id);
                             secret_data.insert("client_secret".to_string(), resp.client_secret);
                             secret_data.insert("issuer".to_string(), discovery.issuer().to_string());
