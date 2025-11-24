@@ -18,7 +18,7 @@ use kube::{
         events::{Event, EventType},
         finalizer::{finalizer, Event as Finalizer},
         metadata_watcher,
-        reflector::{Lookup, ObjectRef},
+        reflector::ObjectRef,
         watcher::Config,
         Controller, WatchStreamExt,
     },
@@ -272,7 +272,7 @@ impl From<i32> for OidcTokenType {
 async fn reconcile(app: Arc<Application>, ctx: Arc<OperatorContext>) -> Result<Action> {
     let ns = app.metadata.namespace.as_ref().unwrap();
     let apps = Api::<Application>::namespaced(ctx.k8s.clone(), &ns);
-    let projs = Api::<Project>::namespaced(ctx.k8s.clone(), &ns);
+    let projs = Api::<Project>::namespaced(ctx.k8s.clone(), app.spec.project_namespace.as_ref().unwrap_or(ns));
     let secrets = Api::<Secret>::namespaced(ctx.k8s.clone(), &ns);
     let recorder = ctx.build_recorder();
 
@@ -752,13 +752,7 @@ pub async fn run(context: Arc<OperatorContext>) {
     controller
         .watches_stream(
             metadata_watcher(projs, Config::default()).touched_objects(),
-            move |proj| {
-                store
-                    .state()
-                    .into_iter()
-                    .filter(move |app| proj.name().map(String::from).as_ref() == Some(&app.spec.project_name))
-                    .map(|app| ObjectRef::from_obj(&*app))
-            },
+            move |_proj| store.state().into_iter().map(|app| ObjectRef::from_obj(&*app)),
         )
         .owns(secrets, Config::default())
         .shutdown_on_signal()

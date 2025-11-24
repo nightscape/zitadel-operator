@@ -13,6 +13,7 @@ pub struct ApplicationSpec {
     #[schemars(length(min = 1, max = 200))]
     pub name: String,
     pub project_name: String,
+    pub project_namespace: Option<String>,
     #[serde(flatten)]
     pub(crate) inner: ApplicationInnerSpec,
 }
