@@ -9,7 +9,7 @@ use zitadel::{
     credentials::{AuthenticationOptions, ServiceAccount},
 };
 use zitadel_operator::{
-    controllers::{application, organization, project},
+    controllers::{application, human_user, organization, project, project_role, user_grant},
     OperatorContext, ZitadelBuilder,
 };
 
@@ -96,9 +96,19 @@ async fn main() -> anyhow::Result<()> {
     info!("Starting controllers...");
     let organization_controller = organization::run(context.clone());
     let project_controller = project::run(context.clone());
+    let project_role_controller = project_role::run(context.clone());
+    let human_user_controller = human_user::run(context.clone());
+    let user_grant_controller = user_grant::run(context.clone());
     let application_controller = application::run(context.clone());
 
-    tokio::join!(organization_controller, project_controller, application_controller);
+    tokio::join!(
+        organization_controller,
+        project_controller,
+        project_role_controller,
+        human_user_controller,
+        user_grant_controller,
+        application_controller
+    );
 
     Ok(())
 }
