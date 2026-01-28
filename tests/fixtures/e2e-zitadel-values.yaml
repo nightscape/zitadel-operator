@@ -1,0 +1,56 @@
+image:
+  tag: "v4.10.0"
+
+zitadel:
+  masterkey: x123456789012345678901234567891y
+  configmapConfig:
+    ExternalDomain: localhost
+    ExternalPort: 8080  # Replaced at runtime with actual host port
+    ExternalSecure: false
+    TLS:
+      Enabled: false
+    Database:
+      Postgres:
+        Host: db-postgresql
+        Port: 5432
+        Database: zitadel
+        MaxOpenConns: 20
+        MaxIdleConns: 10
+        MaxConnLifetime: 30m
+        MaxConnIdleTime: 5m
+        User:
+          Username: zitadel
+          SSL:
+            Mode: disable
+        Admin:
+          Username: postgres
+          SSL:
+            Mode: disable
+    FirstInstance:
+      InstanceName: E2E-Test
+      DefaultLanguage: en
+      Org:
+        Name: E2E
+        Human:
+          UserName: admin@localhost
+          PasswordChangeRequired: false
+        Machine:
+          Machine:
+            Username: e2e-operator
+            Name: E2E Operator Service Account
+          MachineKey:
+            Type: 1
+  secretConfig:
+    Database:
+      Postgres:
+        User:
+          Password: zitadel
+        Admin:
+          Password: postgres
+
+replicaCount: 1
+
+service:
+  type: NodePort
+  port: 8080
+  nodePort: 30080

@@ -30,3 +30,15 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["json", "env-filter"] }
 url = { version = "2.5.4", features = ["serde"] }
 zitadel = { version = "5.3.2", default-features = false, features = ["api", "interceptors", "credentials", "tls-roots"] }
+
+[dev-dependencies]
+proptest = "1.5"
+proptest-state-machine = "0.6"
+testcontainers = "0.26"
+testcontainers-modules = { version = "0.14", features = ["k3s"] }
+tokio = { version = "1.43.0", features = ["process"] }
+rand = "0.8"
+
+[[test]]
+name = "e2e_state_machine"
+path = "tests/e2e_state_machine.rs"

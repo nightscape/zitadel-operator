@@ -414,3 +414,18 @@ tasks:
     desc: Run the operator against Kind cluster
     deps: [cluster:create, cluster:make-cert, cluster:apply-crd]
     cmd: ZITADEL_LOG=debug ZITADEL_SECRET_NAME=zitadel-operator-dev ZITADEL_URL=https://zitadel-operator-dev.127.0.0.1.sslip.io:32443 cargo run --bin=zitadel_operator
+
+  test:e2e:
+    desc: "Run E2E state machine tests (requires Docker)"
+    cmds:
+      - cargo test --test e2e_state_machine -- --nocapture
+    env:
+      PROPTEST_CASES: "{{.PROPTEST_CASES | default 10}}"
+      PROPTEST_VERBOSE: "{{.PROPTEST_VERBOSE | default 0}}"
+
+  test:e2e:verbose:
+    desc: "Run E2E tests with verbose proptest output"
+    cmds:
+      - task: test:e2e
+        vars:
+          PROPTEST_VERBOSE: 1
