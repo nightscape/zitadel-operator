@@ -11,6 +11,8 @@ pub struct ProjectSpec {
     #[schemars(length(min = 1, max = 200))]
     pub name: String,
     pub organization_name: String,
+    #[serde(default)]
+    pub project_role_assertion: bool,
 }
 #[derive(Deserialize, Serialize, Clone, Default, Debug, JsonSchema)]
 #[serde(rename_all = "camelCase")]

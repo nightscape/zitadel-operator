@@ -104,7 +104,10 @@ async fn reconcile(proj: Arc<Project>, ctx: Arc<OperatorContext>) -> Result<Acti
                         retriever: ProjectStateRetriever {
                             management: management.clone(),
                         },
-                        is_equal: |object, proj| object.name == proj.spec.name,
+                        is_equal: |object, proj| {
+                        object.name == proj.spec.name
+                            && object.project_role_assertion == proj.spec.project_role_assertion
+                    },
                     },
                 )
                 .await?;
@@ -119,7 +122,7 @@ async fn reconcile(proj: Arc<Project>, ctx: Arc<OperatorContext>) -> Result<Acti
                                 UpdateProjectRequest {
                                     id: project.id,
                                     name: proj.spec.name.clone(),
-                                    project_role_assertion: project.project_role_assertion,
+                                    project_role_assertion: proj.spec.project_role_assertion,
                                     project_role_check: project.project_role_check,
                                     has_project_check: project.has_project_check,
                                     private_labeling_setting: project.private_labeling_setting,
@@ -151,7 +154,7 @@ async fn reconcile(proj: Arc<Project>, ctx: Arc<OperatorContext>) -> Result<Acti
                             .add_project(create_request_with_org_id(
                                 AddProjectRequest {
                                     name: proj.spec.name.clone(),
-                                    project_role_assertion: false,
+                                    project_role_assertion: proj.spec.project_role_assertion,
                                     project_role_check: false,
                                     has_project_check: false,
                                     private_labeling_setting: PrivateLabelingSetting::Unspecified.into(),
