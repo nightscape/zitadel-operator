@@ -74,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
 
     // this is essentially the same as the zitadel crate does, but doesn't hide error details
     // we pretty much only have this here to make sure that we get useful errors on certificate failures
-    info!("Testing Zitadel connection...");
+    info!("Testing Zitadel connection to {zitadel_url}...");
     Endpoint::from_shared(zitadel_url.to_string())?
         .tls_config(ClientTlsConfig::default().with_native_roots().assume_http2(true))?
         .connect()
