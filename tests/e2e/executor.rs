@@ -1,6 +1,7 @@
 use super::state_machine::{AppVariant, ReferenceState, Transition, ValidationError};
 use super::TestFixture;
 use anyhow::{Context, Result};
+use k8s_openapi::api::core::v1::Secret;
 use kube::{
     api::{DeleteParams, ListParams, Patch, PatchParams},
     Api,
@@ -11,13 +12,22 @@ use std::time::Duration;
 use tracing::{debug, info};
 use zitadel::api::zitadel::org::v2::{ListOrganizationsRequest, OrganizationFieldName};
 use zitadel::api::zitadel::management::v1::{
-    ListAppsRequest, ListProjectRolesRequest, ListProjectsRequest, ListUserGrantRequest,
-    ListUsersRequest,
+    AddHumanUserRequest, AddOrgMemberRequest, AddProjectRequest, AddProjectRoleRequest,
+    AddUserGrantRequest, ListAppsRequest, ListProjectRolesRequest, ListProjectsRequest,
+    ListUserGrantRequest, ListUsersRequest, UpdateProjectRequest, UpdateProjectRoleRequest,
 };
+use zitadel::api::zitadel::project::v1::PrivateLabelingSetting;
 
 /// After an update-only transition (no status phase change to wait for),
 /// sleep this long so the controller has time to reconcile.
 const UPDATE_PROPAGATION_DELAY: Duration = Duration::from_secs(2);
+
+fn requeue_secs() -> u64 {
+    std::env::var("REQUEUE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300)
+}
 
 use zitadel_operator::{
     schema::{
@@ -53,18 +63,56 @@ fn request_with_org_id<T>(req: T, org_id: &str) -> tonic::Request<T> {
 
 pub struct SystemUnderTest {
     k8s: kube::Client,
-    zitadel: ZitadelBuilder,
+    admin_zitadel: ZitadelBuilder,
+    operator_user_id: String,
+    zitadel_ids: HashMap<String, String>,
 }
 
 impl SystemUnderTest {
     pub fn new(fixture: &TestFixture) -> Self {
         Self {
             k8s: fixture.k8s_client.clone(),
-            zitadel: fixture.zitadel_builder.clone(),
+            admin_zitadel: fixture.zitadel_builder.clone(),
+            operator_user_id: fixture.operator_user_id.clone(),
+            zitadel_ids: HashMap::new(),
         }
     }
 
-    pub async fn apply(&self, transition: &Transition) -> Result<()> {
+    async fn resolve_org_zitadel_id(&self, k8s_name: &str) -> Result<String> {
+        if let Some(id) = self.zitadel_ids.get(k8s_name) {
+            return Ok(id.clone());
+        }
+        let orgs: Api<Organization> = Api::all(self.k8s.clone());
+        let org = orgs.get(k8s_name).await.context("Failed to get org from K8s")?;
+        Ok(org.status.as_ref().unwrap().id.clone())
+    }
+
+    async fn resolve_project_zitadel_id(&self, k8s_name: &str) -> Result<String> {
+        if let Some(id) = self.zitadel_ids.get(k8s_name) {
+            return Ok(id.clone());
+        }
+        let projects: Api<Project> = Api::namespaced(self.k8s.clone(), "default");
+        let proj = projects.get(k8s_name).await.context("Failed to get project from K8s")?;
+        Ok(proj.status.as_ref().unwrap().id.clone())
+    }
+
+    async fn resolve_user_zitadel_id(&self, k8s_name: &str) -> Result<String> {
+        if let Some(id) = self.zitadel_ids.get(k8s_name) {
+            return Ok(id.clone());
+        }
+        let users: Api<HumanUser> = Api::namespaced(self.k8s.clone(), "default");
+        let user = users.get(k8s_name).await.context("Failed to get user from K8s")?;
+        Ok(user.status.as_ref().unwrap().id.clone())
+    }
+
+    async fn resolve_org_id_for_project(&self, project_k8s_name: &str, ref_state: &ReferenceState) -> Result<String> {
+        let org_k8s_name = ref_state.projects.get(project_k8s_name)
+            .map(|p| p.org_k8s_name.clone())
+            .context("Project not found in ref state")?;
+        self.resolve_org_zitadel_id(&org_k8s_name).await
+    }
+
+    pub async fn apply(&mut self, transition: &Transition, ref_state: &ReferenceState) -> Result<()> {
         let validation_errors = transition.validation_errors();
         match transition {
             Transition::CreateOrg {
@@ -603,13 +651,253 @@ impl SystemUnderTest {
 
                 self.wait_for_app_deleted(k8s_name).await?;
             }
+
+            // --- Zitadel-direct operations ---
+
+            Transition::ZitadelCreateOrg { k8s_name, display_name } => {
+                info!("ZitadelCreate org {} ({})", k8s_name, display_name);
+                let mut organization = self.admin_zitadel.builder().build_organization_client().await
+                    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+                let resp = organization.add_organization(
+                    zitadel::api::zitadel::org::v2::AddOrganizationRequest {
+                        name: display_name.clone(),
+                        admins: Vec::new(),
+                    },
+                ).await.map_err(|e| anyhow::anyhow!("{:?}", e))?.into_inner();
+
+                let new_org_id = resp.organization_id.clone();
+
+                let mut management = self.admin_zitadel.builder().build_management_client().await
+                    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                management.add_org_member(request_with_org_id(
+                    AddOrgMemberRequest {
+                        user_id: self.operator_user_id.clone(),
+                        roles: vec!["ORG_OWNER".to_string()],
+                    },
+                    &new_org_id,
+                )).await.map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                info!("Added operator SA as ORG_OWNER of new org {}", new_org_id);
+
+                self.zitadel_ids.insert(k8s_name.clone(), new_org_id);
+            }
+
+            Transition::ZitadelCreateProject { k8s_name, display_name, org_k8s_name, project_role_assertion } => {
+                info!("ZitadelCreate project {} ({}) in org {}", k8s_name, display_name, org_k8s_name);
+                let mut management = self.admin_zitadel.builder().build_management_client().await
+                    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                let org_id = self.resolve_org_zitadel_id(org_k8s_name).await?;
+
+                let resp = management.add_project(request_with_org_id(
+                    AddProjectRequest {
+                        name: display_name.clone(),
+                        project_role_assertion: *project_role_assertion,
+                        project_role_check: false,
+                        has_project_check: false,
+                        private_labeling_setting: PrivateLabelingSetting::Unspecified.into(),
+                    },
+                    &org_id,
+                )).await.map_err(|e| anyhow::anyhow!("{:?}", e))?.into_inner();
+
+                self.zitadel_ids.insert(k8s_name.clone(), resp.id);
+            }
+
+            Transition::ZitadelCreateProjectRole { k8s_name, role_key, display_name, group, project_k8s_name } => {
+                info!("ZitadelCreate project role {} ({}) in project {}", k8s_name, role_key, project_k8s_name);
+                let mut management = self.admin_zitadel.builder().build_management_client().await
+                    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                let project_id = self.resolve_project_zitadel_id(project_k8s_name).await?;
+                let org_id = self.resolve_org_id_for_project(project_k8s_name, ref_state).await?;
+
+                management.add_project_role(request_with_org_id(
+                    AddProjectRoleRequest {
+                        project_id: project_id.clone(),
+                        role_key: role_key.clone(),
+                        display_name: display_name.clone(),
+                        group: group.clone().unwrap_or_default(),
+                    },
+                    &org_id,
+                )).await.map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            }
+
+            Transition::ZitadelCreateHumanUser { k8s_name, username, given_name, family_name, nick_name, gender, preferred_language, org_k8s_name } => {
+                info!("ZitadelCreate human user {} ({}) in org {}", k8s_name, username, org_k8s_name);
+                let mut management = self.admin_zitadel.builder().build_management_client().await
+                    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                let org_id = self.resolve_org_zitadel_id(org_k8s_name).await?;
+
+                let display_name_val = format!("{} {}", given_name, family_name);
+                let gender_val: i32 = match gender.as_deref() {
+                    Some("Female") => zitadel::api::zitadel::user::v1::Gender::Female as i32,
+                    Some("Male") => zitadel::api::zitadel::user::v1::Gender::Male as i32,
+                    Some("Diverse") => zitadel::api::zitadel::user::v1::Gender::Diverse as i32,
+                    _ => zitadel::api::zitadel::user::v1::Gender::Unspecified as i32,
+                };
+
+                let resp = management.add_human_user(request_with_org_id(
+                    AddHumanUserRequest {
+                        user_name: username.clone(),
+                        profile: Some(
+                            zitadel::api::zitadel::management::v1::add_human_user_request::Profile {
+                                first_name: given_name.clone(),
+                                last_name: family_name.clone(),
+                                nick_name: nick_name.clone().unwrap_or_default(),
+                                display_name: display_name_val,
+                                preferred_language: preferred_language.clone().unwrap_or_else(|| "en".to_string()),
+                                gender: gender_val,
+                            },
+                        ),
+                        email: Some(
+                            zitadel::api::zitadel::management::v1::add_human_user_request::Email {
+                                email: username.clone(),
+                                is_email_verified: true,
+                            },
+                        ),
+                        phone: None,
+                        initial_password: String::new(),
+                    },
+                    &org_id,
+                )).await.map_err(|e| anyhow::anyhow!("{:?}", e))?.into_inner();
+
+                self.zitadel_ids.insert(k8s_name.clone(), resp.user_id);
+            }
+
+            Transition::ZitadelCreateUserGrant { k8s_name, user_k8s_name, project_k8s_name, role_keys } => {
+                info!("ZitadelCreate user grant {} for user {} in project {}", k8s_name, user_k8s_name, project_k8s_name);
+                let mut management = self.admin_zitadel.builder().build_management_client().await
+                    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                let user_id = self.resolve_user_zitadel_id(user_k8s_name).await?;
+                let project_id = self.resolve_project_zitadel_id(project_k8s_name).await?;
+                let org_id = self.resolve_org_id_for_project(project_k8s_name, ref_state).await?;
+
+                let resp = management.add_user_grant(request_with_org_id(
+                    AddUserGrantRequest {
+                        user_id: user_id.clone(),
+                        project_id: project_id.clone(),
+                        project_grant_id: String::new(),
+                        role_keys: role_keys.clone(),
+                    },
+                    &org_id,
+                )).await.map_err(|e| anyhow::anyhow!("{:?}", e))?.into_inner();
+
+                self.zitadel_ids.insert(k8s_name.clone(), resp.user_grant_id);
+            }
+
+            Transition::ZitadelCreateApp { k8s_name, display_name, project_k8s_name, app_variant } => {
+                info!("ZitadelCreate {:?} app {} ({}) in project {}", app_variant, k8s_name, display_name, project_k8s_name);
+                let mut management = self.admin_zitadel.builder().build_management_client().await
+                    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                let project_id = self.resolve_project_zitadel_id(project_k8s_name).await?;
+                let org_id = self.resolve_org_id_for_project(project_k8s_name, ref_state).await?;
+
+                let app_id = match app_variant {
+                    AppVariant::Oidc => {
+                        let resp = management.add_oidc_app(request_with_org_id(
+                            zitadel::api::zitadel::management::v1::AddOidcAppRequest {
+                                project_id: project_id.clone(),
+                                name: display_name.clone(),
+                                redirect_uris: vec!["http://localhost:8080/callback".to_string()],
+                                response_types: vec![zitadel::api::zitadel::app::v1::OidcResponseType::Code as i32],
+                                grant_types: vec![zitadel::api::zitadel::app::v1::OidcGrantType::AuthorizationCode as i32],
+                                app_type: zitadel::api::zitadel::app::v1::OidcAppType::Web as i32,
+                                auth_method_type: zitadel::api::zitadel::app::v1::OidcAuthMethodType::Basic as i32,
+                                post_logout_redirect_uris: vec![],
+                                version: zitadel::api::zitadel::app::v1::OidcVersion::OidcVersion10 as i32,
+                                dev_mode: false,
+                                access_token_type: zitadel::api::zitadel::app::v1::OidcTokenType::Bearer as i32,
+                                access_token_role_assertion: false,
+                                id_token_role_assertion: false,
+                                id_token_userinfo_assertion: false,
+                                clock_skew: None,
+                                additional_origins: vec![],
+                                skip_native_app_success_page: false,
+                                back_channel_logout_uri: String::new(),
+                            },
+                            &org_id,
+                        )).await.map_err(|e| anyhow::anyhow!("{:?}", e))?.into_inner();
+                        resp.app_id
+                    }
+                    AppVariant::Api => {
+                        let resp = management.add_api_app(request_with_org_id(
+                            zitadel::api::zitadel::management::v1::AddApiAppRequest {
+                                project_id: project_id.clone(),
+                                name: display_name.clone(),
+                                auth_method_type: zitadel::api::zitadel::app::v1::ApiAuthMethodType::Basic as i32,
+                            },
+                            &org_id,
+                        )).await.map_err(|e| anyhow::anyhow!("{:?}", e))?.into_inner();
+                        resp.app_id
+                    }
+                };
+
+                self.zitadel_ids.insert(k8s_name.clone(), app_id);
+            }
+
+            Transition::ZitadelUpdateProject { k8s_name, new_project_role_assertion } => {
+                info!("ZitadelUpdate project {} (pra={})", k8s_name, new_project_role_assertion);
+                let mut management = self.admin_zitadel.builder().build_management_client().await
+                    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                let project_id = self.resolve_project_zitadel_id(k8s_name).await?;
+                let org_id = self.resolve_org_id_for_project(k8s_name, ref_state).await?;
+
+                // Fetch current project to preserve other fields
+                let current = management.get_project_by_id(request_with_org_id(
+                    zitadel::api::zitadel::management::v1::GetProjectByIdRequest { id: project_id.clone() },
+                    &org_id,
+                )).await.map_err(|e| anyhow::anyhow!("{:?}", e))?.into_inner().project.unwrap();
+
+                management.update_project(request_with_org_id(
+                    UpdateProjectRequest {
+                        id: project_id,
+                        name: current.name,
+                        project_role_assertion: *new_project_role_assertion,
+                        project_role_check: current.project_role_check,
+                        has_project_check: current.has_project_check,
+                        private_labeling_setting: current.private_labeling_setting,
+                    },
+                    &org_id,
+                )).await.map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+                if !ref_state.zitadel_only.contains(k8s_name) {
+                    let wait_secs = requeue_secs() + 2;
+                    info!("Waiting {}s for periodic reconcile to auto-fix drift", wait_secs);
+                    tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+                }
+            }
+
+            Transition::ZitadelUpdateProjectRole { k8s_name, new_display_name, new_group } => {
+                info!("ZitadelUpdate project role {} to {} (group={:?})", k8s_name, new_display_name, new_group);
+                let mut management = self.admin_zitadel.builder().build_management_client().await
+                    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+                let role_ref = ref_state.project_roles.get(k8s_name)
+                    .context("Role not found in ref state")?;
+                let project_id = self.resolve_project_zitadel_id(&role_ref.project_k8s_name).await?;
+                let org_id = self.resolve_org_id_for_project(&role_ref.project_k8s_name, ref_state).await?;
+
+                management.update_project_role(request_with_org_id(
+                    UpdateProjectRoleRequest {
+                        project_id,
+                        role_key: role_ref.role_key.clone(),
+                        display_name: new_display_name.clone(),
+                        group: new_group.clone().unwrap_or_default(),
+                    },
+                    &org_id,
+                )).await.map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+                if !ref_state.zitadel_only.contains(k8s_name) {
+                    let wait_secs = requeue_secs() + 2;
+                    info!("Waiting {}s for periodic reconcile to auto-fix drift", wait_secs);
+                    tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+                }
+            }
         }
         Ok(())
     }
 
     pub async fn verify(&self, expected: &ReferenceState) -> Result<()> {
         let mut org_client = self
-            .zitadel
+            .admin_zitadel
             .builder()
             .build_organization_client()
             .await
@@ -665,7 +953,7 @@ impl SystemUnderTest {
             .collect();
 
         let mut management = self
-            .zitadel
+            .admin_zitadel
             .builder()
             .build_management_client()
             .await
@@ -1009,7 +1297,21 @@ impl SystemUnderTest {
             }
         }
 
-        info!("Deep verify passed: all orgs, projects, roles, users, grants, and apps match");
+        // Verify K8s Secrets exist for operator-managed applications (not zitadel_only)
+        let secrets: Api<Secret> = Api::namespaced(self.k8s.clone(), "default");
+        for (app_k8s_name, _app_ref) in &expected.applications {
+            if expected.zitadel_only.contains(app_k8s_name) {
+                continue;
+            }
+            let secret = secrets.get_opt(app_k8s_name).await?;
+            assert!(
+                secret.is_some(),
+                "Expected K8s Secret '{}' for operator-managed application not found",
+                app_k8s_name
+            );
+        }
+
+        info!("Deep verify passed: all orgs, projects, roles, users, grants, apps, and secrets match");
         Ok(())
     }
 

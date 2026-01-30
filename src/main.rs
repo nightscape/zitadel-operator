@@ -5,7 +5,10 @@ use tonic::transport::{ClientTlsConfig, Endpoint};
 use tracing::info;
 use tracing_subscriber::{prelude::*, EnvFilter};
 use zitadel::{
-    api::{interceptors::ServiceAccountInterceptor, zitadel::management::v1::GetMyOrgRequest},
+    api::{
+        interceptors::ServiceAccountInterceptor,
+        zitadel::{auth::v1::GetMyUserRequest, management::v1::GetMyOrgRequest},
+    },
     credentials::{AuthenticationOptions, ServiceAccount},
 };
 use zitadel_operator::{
@@ -80,18 +83,34 @@ async fn main() -> anyhow::Result<()> {
         .connect()
         .await?;
 
-    let context = Arc::new(OperatorContext {
-        k8s: k8s.clone(),
-        zitadel: ZitadelBuilder::new(zitadel_url, interceptor),
-    });
-    context
-        .zitadel
+    let zitadel_builder = ZitadelBuilder::new(zitadel_url, interceptor);
+
+    zitadel_builder
         .builder()
         .build_management_client()
         .await
         .map_err(|e| anyhow::anyhow!(format!("{:?}", e)))?
         .get_my_org(GetMyOrgRequest {})
         .await?;
+
+    let operator_user_id = zitadel_builder
+        .builder()
+        .build_auth_client()
+        .await
+        .map_err(|e| anyhow::anyhow!(format!("{:?}", e)))?
+        .get_my_user(GetMyUserRequest {})
+        .await?
+        .into_inner()
+        .user
+        .expect("auth.get_my_user returned no user")
+        .id;
+    info!("Operator user ID: {}", operator_user_id);
+
+    let context = Arc::new(OperatorContext {
+        k8s: k8s.clone(),
+        zitadel: zitadel_builder,
+        operator_user_id,
+    });
 
     info!("Starting controllers...");
     let organization_controller = organization::run(context.clone());

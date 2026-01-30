@@ -9,8 +9,17 @@ use serde::{
     Serialize,
 };
 use serde_json::json;
-use std::{fmt::Debug, sync::Arc};
+use std::{env, fmt::Debug, sync::Arc};
 use tonic::Request;
+
+const DEFAULT_REQUEUE_SECS: u64 = 300;
+
+pub fn requeue_secs() -> u64 {
+    env::var("REQUEUE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_REQUEUE_SECS)
+}
 
 pub async fn patch_status<T: Resource<DynamicType = ()> + de::DeserializeOwned, S: Serialize>(
     api: &Api<T>,

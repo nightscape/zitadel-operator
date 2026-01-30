@@ -6,8 +6,11 @@ identity management into your cloud-native workflows.
 
 ## Features
 
-* Manage ZITADEL organizations, projects, and applications via Kubernetes custom resources
-* Automatically generate Kubernetes `Secret`s with application client ID and secret
+* Manage ZITADEL organizations, projects, human users, project roles, user grants, and applications via Kubernetes custom resources
+* Automatically generate Kubernetes `Secret`s with application client ID, client secret, and OIDC discovery endpoints
+* Adopt existing ZITADEL resources: when a CRD is created whose name matches an existing ZITADEL resource, the operator adopts it instead of creating a duplicate
+* Periodic reconciliation: the operator re-checks ZITADEL state at a configurable interval, automatically fixing drift between CRD spec and ZITADEL (set `REQUEUE_SECS`, default 300)
+* Property-based E2E tests using `proptest` state machine testing, including Zitadel-direct gRPC operations that validate adoption and drift correction
 
 ## Getting Started (Development)
 

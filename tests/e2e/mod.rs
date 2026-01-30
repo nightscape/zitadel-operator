@@ -18,6 +18,11 @@ use tokio::process::Command;
 use tokio::sync::OnceCell;
 use tracing::info;
 use zitadel::api::interceptors::ServiceAccountInterceptor;
+use zitadel::api::zitadel::authn::v1::KeyType;
+use zitadel::api::zitadel::management::v1::{
+    AddMachineKeyRequest, AddMachineUserRequest, AddOrgMemberRequest,
+};
+use zitadel::api::zitadel::user::v1::AccessTokenType;
 use zitadel::credentials::{AuthenticationOptions, ServiceAccount};
 use zitadel_operator::{
     controllers::{application, human_user, organization, project, project_role, user_grant},
@@ -36,6 +41,7 @@ const E2E_CONTAINER_LABEL: &str = "zitadel-e2e-test";
 pub struct TestFixture {
     pub k8s_client: Client,
     pub zitadel_builder: ZitadelBuilder,
+    pub operator_user_id: String,
     pub zitadel_url: String,
     _k3s: ContainerAsync<GenericImage>,
     _kubeconfig_path: PathBuf,
@@ -169,6 +175,16 @@ impl TestFixture {
 
         let zitadel_builder = create_zitadel_builder(&zitadel_url, &sa_json)?;
 
+        info!("Discovering operator user ID...");
+        let operator_user_id = {
+            let mut auth = zitadel_builder.builder().build_auth_client().await
+                .map_err(|e| anyhow!("Failed to build auth client: {:?}", e))?;
+            let resp = auth.get_my_user(zitadel::api::zitadel::auth::v1::GetMyUserRequest {}).await
+                .map_err(|e| anyhow!("Failed to get my user: {:?}", e))?;
+            resp.into_inner().user.expect("auth.get_my_user returned no user").id
+        };
+        info!("Operator user ID: {}", operator_user_id);
+
         // Wait for CRD storage to be fully ready (not just "established"),
         // otherwise controllers hit 429s during initial watch setup and enter
         // 60-second error backoff.
@@ -178,6 +194,7 @@ impl TestFixture {
         let ctx = Arc::new(OperatorContext {
             k8s: k8s_client.clone(),
             zitadel: zitadel_builder.clone(),
+            operator_user_id: operator_user_id.clone(),
         });
         start_controllers(ctx);
 
@@ -185,6 +202,7 @@ impl TestFixture {
         Ok(TestFixture {
             k8s_client,
             zitadel_builder,
+            operator_user_id,
             zitadel_url,
             _k3s: k3s,
             _kubeconfig_path: kubeconfig_path,
@@ -224,6 +242,34 @@ impl TestFixture {
         delete_all_crs(&orgs).await?;
         wait_until_empty(&orgs).await?;
 
+        // Clean up Zitadel-direct resources (orgs not managed by CRDs)
+        self.cleanup_zitadel_direct_orgs().await?;
+
+        Ok(())
+    }
+
+    async fn cleanup_zitadel_direct_orgs(&self) -> Result<()> {
+        use zitadel::api::zitadel::org::v2::{ListOrganizationsRequest, OrganizationFieldName};
+        use zitadel::api::zitadel::admin::v1::RemoveOrgRequest;
+
+        let mut org_client = self.zitadel_builder.builder().build_organization_client().await
+            .map_err(|e| anyhow!("Failed to build org client: {:?}", e))?;
+        let mut admin = self.zitadel_builder.builder().build_admin_client().await
+            .map_err(|e| anyhow!("Failed to build admin client: {:?}", e))?;
+
+        let orgs = org_client.list_organizations(ListOrganizationsRequest {
+            queries: vec![],
+            query: None,
+            sorting_column: OrganizationFieldName::Unspecified as i32,
+        }).await?.into_inner();
+
+        for org in orgs.result {
+            if org.name == "ZITADEL" || org.name == "E2E" {
+                continue;
+            }
+            info!("Deleting Zitadel-direct org: {} ({})", org.name, org.id);
+            let _ = admin.remove_org(RemoveOrgRequest { org_id: org.id }).await;
+        }
         Ok(())
     }
 }
@@ -420,6 +466,53 @@ async fn apply_crds(client: &Client) -> Result<()> {
     Ok(())
 }
 
+async fn create_operator_service_account(admin_builder: &ZitadelBuilder) -> Result<(String, String)> {
+    let mut management = admin_builder
+        .builder()
+        .build_management_client()
+        .await
+        .map_err(|e| anyhow!("Failed to build management client: {:?}", e))?;
+
+    let user_resp = management
+        .add_machine_user(AddMachineUserRequest {
+            user_name: "e2e-restricted-operator".to_string(),
+            name: "E2E Restricted Operator".to_string(),
+            description: "Restricted SA for e2e controller tests".to_string(),
+            access_token_type: AccessTokenType::Jwt as i32,
+            user_id: None,
+        })
+        .await
+        .map_err(|e| anyhow!("Failed to create machine user: {:?}", e))?
+        .into_inner();
+    let user_id = user_resp.user_id;
+    info!("Created operator machine user: {}", user_id);
+
+    let key_resp = management
+        .add_machine_key(AddMachineKeyRequest {
+            user_id: user_id.clone(),
+            r#type: KeyType::Json as i32,
+            expiration_date: None,
+            public_key: vec![],
+        })
+        .await
+        .map_err(|e| anyhow!("Failed to create machine key: {:?}", e))?
+        .into_inner();
+    let sa_json = String::from_utf8(key_resp.key_details)
+        .map_err(|e| anyhow!("Invalid key details: {:?}", e))?;
+    info!("Created operator machine key: {}", key_resp.key_id);
+
+    management
+        .add_org_member(AddOrgMemberRequest {
+            user_id: user_id.clone(),
+            roles: vec!["ORG_OWNER".to_string()],
+        })
+        .await
+        .map_err(|e| anyhow!("Failed to add org member: {:?}", e))?;
+    info!("Added operator as ORG_OWNER of default org");
+
+    Ok((user_id, sa_json))
+}
+
 fn create_zitadel_builder(zitadel_url: &str, sa_json: &str) -> Result<ZitadelBuilder> {
     let sa = ServiceAccount::load_from_json(sa_json)
         .map_err(|e| anyhow!("Failed to load service account: {:?}", e))?;
@@ -439,6 +532,7 @@ fn create_zitadel_builder(zitadel_url: &str, sa_json: &str) -> Result<ZitadelBui
 fn start_controllers(ctx: Arc<OperatorContext>) {
     unsafe {
         std::env::set_var("ZITADEL_DELETE_ORG", "1");
+        std::env::set_var("REQUEUE_SECS", "5");
     }
 
     tokio::spawn(organization::run(ctx.clone()));

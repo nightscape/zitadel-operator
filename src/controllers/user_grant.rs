@@ -1,6 +1,6 @@
 use crate::{
     schema::{HumanUser, Project, UserGrant, UserGrantPhase, UserGrantStatus},
-    util::{create_request_with_org_id, patch_status, GetStatus, IsReady},
+    util::{create_request_with_org_id, patch_status, requeue_secs, GetStatus, IsReady},
     Error, OperatorContext, Result,
 };
 use futures::StreamExt;
@@ -64,7 +64,7 @@ async fn reconcile(grant: Arc<UserGrant>, ctx: Arc<OperatorContext>) -> Result<A
                                 &grant.object_ref(&()),
                             )
                             .await?;
-                        return Ok(Action::await_change());
+                        return Ok(Action::requeue(Duration::from_secs(requeue_secs())));
                     }
                     Some(user) => user,
                 };
@@ -85,7 +85,7 @@ async fn reconcile(grant: Arc<UserGrant>, ctx: Arc<OperatorContext>) -> Result<A
                                 &grant.object_ref(&()),
                             )
                             .await?;
-                        return Ok(Action::await_change());
+                        return Ok(Action::requeue(Duration::from_secs(requeue_secs())));
                     }
                 };
 
@@ -106,7 +106,7 @@ async fn reconcile(grant: Arc<UserGrant>, ctx: Arc<OperatorContext>) -> Result<A
                                 &grant.object_ref(&()),
                             )
                             .await?;
-                        return Ok(Action::await_change());
+                        return Ok(Action::requeue(Duration::from_secs(requeue_secs())));
                     }
                     Some(proj) => proj,
                 };
@@ -127,7 +127,7 @@ async fn reconcile(grant: Arc<UserGrant>, ctx: Arc<OperatorContext>) -> Result<A
                                 &grant.object_ref(&()),
                             )
                             .await?;
-                        return Ok(Action::await_change());
+                        return Ok(Action::requeue(Duration::from_secs(requeue_secs())));
                     }
                 };
 
@@ -178,7 +178,7 @@ async fn reconcile(grant: Arc<UserGrant>, ctx: Arc<OperatorContext>) -> Result<A
                                         )
                                         .await?;
                                 }
-                                return Ok(Action::await_change());
+                                return Ok(Action::requeue(Duration::from_secs(requeue_secs())));
                             }
                         }
                         Err(e) if e.code() == Code::NotFound => {
@@ -248,7 +248,7 @@ async fn reconcile(grant: Arc<UserGrant>, ctx: Arc<OperatorContext>) -> Result<A
                         )
                         .await?;
 
-                    return Ok(Action::await_change());
+                    return Ok(Action::requeue(Duration::from_secs(requeue_secs())));
                 }
 
                 // Grant doesn't exist, create it
@@ -293,7 +293,7 @@ async fn reconcile(grant: Arc<UserGrant>, ctx: Arc<OperatorContext>) -> Result<A
                     )
                     .await?;
 
-                Ok(Action::await_change())
+                Ok(Action::requeue(Duration::from_secs(requeue_secs())))
             }
             Finalizer::Cleanup(grant) => {
                 info!("cleaning up user grant {}", grant.name_any());
