@@ -4,8 +4,8 @@ use crate::{
         OidcAuthMethodType, OidcTokenType, OidcVersion, Project, ResponseType,
     },
     util::{
-        create_request_with_org_id, patch_status, CurrentState, CurrentStateParameters, CurrentStateRetriever,
-        GetStatus,
+        create_request_with_org_id, patch_status, requeue_secs, CurrentState, CurrentStateParameters,
+        CurrentStateRetriever, GetStatus,
     },
     Error, OperatorContext, Result,
 };
@@ -32,7 +32,8 @@ use zitadel::api::{
     interceptors::ServiceAccountInterceptor,
     zitadel::management::v1::{
         management_service_client::ManagementServiceClient, GetAppByIdRequest, GetOidcInformationRequest,
-        ListAppsRequest, RemoveAppRequest, UpdateApiAppConfigRequest, UpdateAppRequest, UpdateOidcAppConfigRequest,
+        ListAppsRequest, RegenerateApiClientSecretRequest, RegenerateOidcClientSecretRequest,
+        RemoveAppRequest, UpdateApiAppConfigRequest, UpdateAppRequest, UpdateOidcAppConfigRequest,
     },
 };
 
@@ -657,7 +658,75 @@ async fn reconcile(app: Arc<Application>, ctx: Arc<OperatorContext>) -> Result<A
                             .await?;
                     }
                     CurrentState::FoundAdoptable(application, proj) => {
-                        debug!("application found, attaching id to resource");
+                        debug!("application found, adopting");
+
+                        let secret = secrets.get_opt(app.metadata.name.as_ref().unwrap()).await?;
+                        if secret.is_none() {
+                            let (client_id, client_secret) = match &application.config {
+                                Some(zitadel::api::zitadel::app::v1::app::Config::OidcConfig(oidc_config)) => {
+                                    let regen = management
+                                        .regenerate_oidc_client_secret(create_request_with_org_id(
+                                            RegenerateOidcClientSecretRequest {
+                                                project_id: proj.id.clone(),
+                                                app_id: application.id.clone(),
+                                            },
+                                            proj.organization_id.clone(),
+                                        ))
+                                        .await?
+                                        .into_inner();
+                                    (oidc_config.client_id.clone(), regen.client_secret)
+                                }
+                                Some(zitadel::api::zitadel::app::v1::app::Config::ApiConfig(api_config)) => {
+                                    let regen = management
+                                        .regenerate_api_client_secret(create_request_with_org_id(
+                                            RegenerateApiClientSecretRequest {
+                                                project_id: proj.id.clone(),
+                                                app_id: application.id.clone(),
+                                            },
+                                            proj.organization_id.clone(),
+                                        ))
+                                        .await?
+                                        .into_inner();
+                                    (api_config.client_id.clone(), regen.client_secret)
+                                }
+                                _ => unreachable!("SAML not supported"),
+                            };
+
+                            let issuer = management.get_oidc_information(GetOidcInformationRequest {}).await?.into_inner().issuer;
+                            let discovery = CoreProviderMetadata::discover_async(
+                                IssuerUrl::new(issuer).map_err(|e| Error::Other(format!("failed to discover OIDC provider metadata: {:?}", e)))?,
+                                async_http_client
+                            ).await.map_err(|e| Error::Other(format!("failed to discover OIDC provider metadata: {:?}", e)))?;
+
+                            let mut secret_data = BTreeMap::new();
+                            secret_data.insert("zitadel_organization_id".to_string(), proj.organization_id.clone());
+                            secret_data.insert("zitadel_project_id".to_string(), proj.id.clone());
+                            secret_data.insert("zitadel_application_id".to_string(), application.id.clone());
+                            secret_data.insert("client_id".to_string(), client_id);
+                            secret_data.insert("client_secret".to_string(), client_secret);
+                            secret_data.insert("issuer".to_string(), discovery.issuer().to_string());
+                            secret_data.insert("auth_endpoint".to_string(), discovery.authorization_endpoint().to_string());
+                            secret_data.insert("jwks_uri".to_string(), discovery.jwks_uri().to_string());
+                            if let Some(token_endpoint) = discovery.token_endpoint() {
+                                secret_data.insert("token_endpoint".to_string(), token_endpoint.to_string());
+                            }
+                            if let Some(userinfo_endpoint) = discovery.userinfo_endpoint() {
+                                secret_data.insert("userinfo_endpoint".to_string(), userinfo_endpoint.to_string());
+                            }
+                            let secret = Secret {
+                                metadata: ObjectMeta {
+                                    name: Some(app.metadata.name.as_ref().unwrap().clone()),
+                                    namespace: app.metadata.namespace.clone(),
+                                    owner_references: Some(vec![app
+                                        .controller_owner_ref(&())
+                                        .unwrap()]),
+                                    ..Default::default()
+                                },
+                                string_data: Some(secret_data),
+                                ..Default::default()
+                            };
+                            secrets.create(&Default::default(), &secret).await?;
+                        }
 
                         patch_status(
                             &apps,
@@ -675,7 +744,7 @@ async fn reconcile(app: Arc<Application>, ctx: Arc<OperatorContext>) -> Result<A
                             .publish(
                                 &Event {
                                     type_: EventType::Normal,
-                                    reason: "Creating".to_string(),
+                                    reason: "Adopted".to_string(),
                                     note: Some("Existing application adopted".to_string()),
                                     action: "Adopted".to_string(),
                                     secondary: None,
@@ -686,7 +755,7 @@ async fn reconcile(app: Arc<Application>, ctx: Arc<OperatorContext>) -> Result<A
                     }
                 }
 
-                Ok(Action::await_change())
+                Ok(Action::requeue(Duration::from_secs(requeue_secs())))
             }
             Finalizer::Cleanup(app) => {
                 info!("cleaning up application {}", app.name_any());

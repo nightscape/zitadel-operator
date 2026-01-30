@@ -59,6 +59,7 @@ impl ZitadelBuilder {
 pub struct OperatorContext {
     pub k8s: Client,
     pub zitadel: ZitadelBuilder,
+    pub operator_user_id: String,
 }
 impl OperatorContext {
     pub fn build_recorder(&self) -> Recorder {

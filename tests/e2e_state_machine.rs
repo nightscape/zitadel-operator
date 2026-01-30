@@ -49,7 +49,7 @@ impl StateMachineTest for OperatorStateMachine {
     }
 
     fn apply(
-        state: Self::SystemUnderTest,
+        mut state: Self::SystemUnderTest,
         ref_state: &<Self::Reference as ReferenceStateMachine>::State,
         transition: <Self::Reference as ReferenceStateMachine>::Transition,
     ) -> Self::SystemUnderTest {
@@ -57,7 +57,7 @@ impl StateMachineTest for OperatorStateMachine {
 
         rt.block_on(async {
             info!("Applying transition: {:?}", transition);
-            state.apply(&transition).await.expect("transition failed");
+            state.apply(&transition, ref_state).await.expect("transition failed");
 
             let new_ref = <OperatorStateMachine as ReferenceStateMachine>::apply(ref_state.clone(), &transition);
             state.verify(&new_ref).await.expect("verification failed");

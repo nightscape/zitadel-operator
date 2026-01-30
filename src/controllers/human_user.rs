@@ -1,6 +1,6 @@
 use crate::{
     schema::{Gender, HumanUser, HumanUserPhase, HumanUserStatus, Organization},
-    util::{create_request_with_org_id, patch_status, GetStatus, IsReady},
+    util::{create_request_with_org_id, patch_status, requeue_secs, GetStatus, IsReady},
     Error, OperatorContext, Result,
 };
 use futures::StreamExt;
@@ -69,7 +69,7 @@ async fn reconcile(user: Arc<HumanUser>, ctx: Arc<OperatorContext>) -> Result<Ac
                                 &user.object_ref(&()),
                             )
                             .await?;
-                        return Ok(Action::await_change());
+                        return Ok(Action::requeue(Duration::from_secs(requeue_secs())));
                     }
                     Some(org) => org,
                 };
@@ -90,7 +90,7 @@ async fn reconcile(user: Arc<HumanUser>, ctx: Arc<OperatorContext>) -> Result<Ac
                                 &user.object_ref(&()),
                             )
                             .await?;
-                        return Ok(Action::await_change());
+                        return Ok(Action::requeue(Duration::from_secs(requeue_secs())));
                     }
                 };
 
@@ -110,7 +110,7 @@ async fn reconcile(user: Arc<HumanUser>, ctx: Arc<OperatorContext>) -> Result<Ac
                             if resp.into_inner().user.is_some() {
                                 // User exists, no update support in v1 API
                                 debug!("user exists, skipping (updates not supported in v1 API)");
-                                return Ok(Action::await_change());
+                                return Ok(Action::requeue(Duration::from_secs(requeue_secs())));
                             }
                         }
                         Err(e) if e.code() == Code::NotFound => {
@@ -165,7 +165,7 @@ async fn reconcile(user: Arc<HumanUser>, ctx: Arc<OperatorContext>) -> Result<Ac
                         )
                         .await?;
 
-                    return Ok(Action::await_change());
+                    return Ok(Action::requeue(Duration::from_secs(requeue_secs())));
                 }
 
                 // User doesn't exist, create it
@@ -265,7 +265,7 @@ async fn reconcile(user: Arc<HumanUser>, ctx: Arc<OperatorContext>) -> Result<Ac
                     )
                     .await?;
 
-                Ok(Action::await_change())
+                Ok(Action::requeue(Duration::from_secs(requeue_secs())))
             }
             Finalizer::Cleanup(user) => {
                 info!("cleaning up human user {}", user.name_any());

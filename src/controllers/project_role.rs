@@ -1,6 +1,6 @@
 use crate::{
     schema::{Project, ProjectRole, ProjectRolePhase, ProjectRoleStatus},
-    util::{create_request_with_org_id, patch_status, GetStatus, IsReady},
+    util::{create_request_with_org_id, patch_status, requeue_secs, GetStatus, IsReady},
     Error, OperatorContext, Result,
 };
 use futures::StreamExt;
@@ -60,7 +60,7 @@ async fn reconcile(role: Arc<ProjectRole>, ctx: Arc<OperatorContext>) -> Result<
                                 &role.object_ref(&()),
                             )
                             .await?;
-                        return Ok(Action::await_change());
+                        return Ok(Action::requeue(Duration::from_secs(requeue_secs())));
                     }
                     Some(proj) => proj,
                 };
@@ -81,7 +81,7 @@ async fn reconcile(role: Arc<ProjectRole>, ctx: Arc<OperatorContext>) -> Result<
                                 &role.object_ref(&()),
                             )
                             .await?;
-                        return Ok(Action::await_change());
+                        return Ok(Action::requeue(Duration::from_secs(requeue_secs())));
                     }
                 };
 
@@ -225,7 +225,7 @@ async fn reconcile(role: Arc<ProjectRole>, ctx: Arc<OperatorContext>) -> Result<
                     }
                 }
 
-                Ok(Action::await_change())
+                Ok(Action::requeue(Duration::from_secs(requeue_secs())))
             }
             Finalizer::Cleanup(role) => {
                 info!("cleaning up project role {}", role.name_any());

@@ -1,8 +1,8 @@
 use crate::{
     schema::{Organization, Project, ProjectPhase, ProjectStatus},
     util::{
-        create_request_with_org_id, patch_status, CurrentState, CurrentStateParameters, CurrentStateRetriever,
-        GetStatus,
+        create_request_with_org_id, patch_status, requeue_secs, CurrentState, CurrentStateParameters,
+        CurrentStateRetriever, GetStatus,
     },
     Error, OperatorContext, Result,
 };
@@ -249,7 +249,7 @@ async fn reconcile(proj: Arc<Project>, ctx: Arc<OperatorContext>) -> Result<Acti
                     }
                 }
 
-                Ok(Action::await_change())
+                Ok(Action::requeue(Duration::from_secs(requeue_secs())))
             }
             Finalizer::Cleanup(proj) => {
                 info!("cleaning up project {}", proj.name_any());
