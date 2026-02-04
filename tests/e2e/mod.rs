@@ -9,6 +9,7 @@ use kube::{
     runtime::wait::{await_condition, conditions},
     Api, Client, CustomResourceExt, ResourceExt,
 };
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -17,7 +18,6 @@ use testcontainers::{core::{ContainerPort, WaitFor}, runners::AsyncRunner, Conta
 use tokio::process::Command;
 use tokio::sync::OnceCell;
 use tracing::info;
-use zitadel::api::interceptors::ServiceAccountInterceptor;
 use zitadel::api::zitadel::authn::v1::KeyType;
 use zitadel::api::zitadel::management::v1::{
     AddMachineKeyRequest, AddMachineUserRequest, AddOrgMemberRequest,
@@ -195,6 +195,7 @@ impl TestFixture {
             k8s: k8s_client.clone(),
             zitadel: zitadel_builder.clone(),
             operator_user_id: operator_user_id.clone(),
+            custom_headers: HashMap::new(),
         });
         start_controllers(ctx);
 
@@ -517,16 +518,15 @@ fn create_zitadel_builder(zitadel_url: &str, sa_json: &str) -> Result<ZitadelBui
     let sa = ServiceAccount::load_from_json(sa_json)
         .map_err(|e| anyhow!("Failed to load service account: {:?}", e))?;
 
-    let interceptor = ServiceAccountInterceptor::new(
-        zitadel_url,
+    Ok(ZitadelBuilder::new(
+        zitadel_url.to_string(),
         &sa,
-        Some(AuthenticationOptions {
+        AuthenticationOptions {
             api_access: true,
             ..Default::default()
-        }),
-    );
-
-    Ok(ZitadelBuilder::new(zitadel_url.to_string(), interceptor))
+        },
+        HashMap::new(),
+    ))
 }
 
 fn start_controllers(ctx: Arc<OperatorContext>) {

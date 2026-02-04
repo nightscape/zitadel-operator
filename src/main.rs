@@ -1,14 +1,11 @@
 use k8s_openapi::api::core::v1::Secret;
 use kube::{Api, Client};
-use std::{env, sync::Arc};
+use std::{collections::HashMap, env, sync::Arc};
 use tonic::transport::{ClientTlsConfig, Endpoint};
 use tracing::info;
 use tracing_subscriber::{prelude::*, EnvFilter};
 use zitadel::{
-    api::{
-        interceptors::ServiceAccountInterceptor,
-        zitadel::{auth::v1::GetMyUserRequest, management::v1::GetMyOrgRequest},
-    },
+    api::zitadel::{auth::v1::GetMyUserRequest, management::v1::GetMyOrgRequest},
     credentials::{AuthenticationOptions, ServiceAccount},
 };
 use zitadel_operator::{
@@ -66,24 +63,41 @@ async fn main() -> anyhow::Result<()> {
 
     let zitadel_url = env::var("ZITADEL_URL").expect("missing ZITADEL_URL");
 
-    let interceptor = ServiceAccountInterceptor::new(
-        &zitadel_url,
+    let custom_headers: HashMap<String, String> = env::var("ZITADEL_HEADERS")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|pair| {
+            let (key, value) = pair.split_once('=')
+                .unwrap_or_else(|| panic!("invalid ZITADEL_HEADERS entry (expected key=value): {pair}"));
+            (key.trim().to_string(), value.trim().to_string())
+        })
+        .collect();
+    if !custom_headers.is_empty() {
+        info!("Custom headers: {:?}", custom_headers.keys().collect::<Vec<_>>());
+    }
+
+    info!("Testing Zitadel connection to {zitadel_url}...");
+    if zitadel_url.starts_with("https://") {
+        Endpoint::from_shared(zitadel_url.to_string())?
+            .tls_config(ClientTlsConfig::default().with_native_roots().assume_http2(true))?
+            .connect()
+            .await?;
+    } else {
+        Endpoint::from_shared(zitadel_url.to_string())?
+            .connect()
+            .await?;
+    }
+
+    let zitadel_builder = ZitadelBuilder::new(
+        zitadel_url,
         &sa,
-        Some(AuthenticationOptions {
+        AuthenticationOptions {
             api_access: true,
             ..Default::default()
-        }),
+        },
+        custom_headers.clone(),
     );
-
-    // this is essentially the same as the zitadel crate does, but doesn't hide error details
-    // we pretty much only have this here to make sure that we get useful errors on certificate failures
-    info!("Testing Zitadel connection to {zitadel_url}...");
-    Endpoint::from_shared(zitadel_url.to_string())?
-        .tls_config(ClientTlsConfig::default().with_native_roots().assume_http2(true))?
-        .connect()
-        .await?;
-
-    let zitadel_builder = ZitadelBuilder::new(zitadel_url, interceptor);
 
     zitadel_builder
         .builder()
@@ -110,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
         k8s: k8s.clone(),
         zitadel: zitadel_builder,
         operator_user_id,
+        custom_headers,
     });
 
     info!("Starting controllers...");

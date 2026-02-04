@@ -22,21 +22,20 @@ use kube::{
 use std::{sync::Arc, time::Duration};
 use tonic::{service::interceptor::InterceptedService, Code};
 use tracing::{debug, info, instrument, warn};
-use zitadel::api::{
-    interceptors::ServiceAccountInterceptor,
-    zitadel::{
-        management::v1::{
-            management_service_client::ManagementServiceClient, AddProjectRequest, GetProjectByIdRequest,
-            ListProjectsRequest, RemoveProjectRequest, UpdateProjectRequest,
-        },
-        project::v1::PrivateLabelingSetting,
+use zitadel::api::zitadel::{
+    management::v1::{
+        management_service_client::ManagementServiceClient, AddProjectRequest, GetProjectByIdRequest,
+        ListProjectsRequest, RemoveProjectRequest, UpdateProjectRequest,
     },
+    project::v1::PrivateLabelingSetting,
 };
+
+use crate::CustomHeaderInterceptor;
 
 pub static PROJECT_FINALIZER: &str = "project.zitadel.org";
 
 struct ProjectStateRetriever {
-    pub management: ManagementServiceClient<InterceptedService<tonic::transport::Channel, ServiceAccountInterceptor>>,
+    pub management: ManagementServiceClient<InterceptedService<tonic::transport::Channel, CustomHeaderInterceptor>>,
 }
 impl CurrentStateRetriever<Project, zitadel::api::zitadel::project::v1::Project, Organization>
     for ProjectStateRetriever

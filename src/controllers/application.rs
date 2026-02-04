@@ -24,18 +24,16 @@ use kube::{
     },
     Api, Resource, ResourceExt,
 };
-use openidconnect::{core::CoreProviderMetadata, reqwest::async_http_client, IssuerUrl};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tonic::{service::interceptor::InterceptedService, Code};
 use tracing::{debug, info, instrument, warn};
-use zitadel::api::{
-    interceptors::ServiceAccountInterceptor,
-    zitadel::management::v1::{
-        management_service_client::ManagementServiceClient, GetAppByIdRequest, GetOidcInformationRequest,
-        ListAppsRequest, RegenerateApiClientSecretRequest, RegenerateOidcClientSecretRequest,
-        RemoveAppRequest, UpdateApiAppConfigRequest, UpdateAppRequest, UpdateOidcAppConfigRequest,
-    },
+use zitadel::api::zitadel::management::v1::{
+    management_service_client::ManagementServiceClient, GetAppByIdRequest,
+    ListAppsRequest, RegenerateApiClientSecretRequest, RegenerateOidcClientSecretRequest,
+    RemoveAppRequest, UpdateApiAppConfigRequest, UpdateAppRequest, UpdateOidcAppConfigRequest,
 };
+
+use crate::CustomHeaderInterceptor;
 
 pub static APPLICATION_FINALIZER: &str = "application.zitadel.org";
 
@@ -76,7 +74,7 @@ impl Into<AddAppResponse> for zitadel::api::zitadel::management::v1::AddApiAppRe
 }
 
 struct ApplicationStateRetriever {
-    pub management: ManagementServiceClient<InterceptedService<tonic::transport::Channel, ServiceAccountInterceptor>>,
+    pub management: ManagementServiceClient<InterceptedService<tonic::transport::Channel, CustomHeaderInterceptor>>,
 }
 impl CurrentStateRetriever<Application, zitadel::api::zitadel::app::v1::App, Project> for ApplicationStateRetriever {
     async fn get_object(
@@ -564,11 +562,9 @@ async fn reconcile(app: Arc<Application>, ctx: Arc<OperatorContext>) -> Result<A
                                     .into(),
                             };
 
-                            let issuer = management.get_oidc_information(GetOidcInformationRequest {}).await?.into_inner().issuer;
-                            let discovery = CoreProviderMetadata::discover_async(
-                                IssuerUrl::new(issuer).map_err(|e| Error::Other(format!("failed to discover OIDC provider metadata: {:?}", e)))?,
-                                async_http_client
-                            ).await.map_err(|e| Error::Other(format!("failed to discover OIDC provider metadata: {:?}", e)))?;
+                            let discovery = crate::discover_metadata(ctx.zitadel.url(), &ctx.custom_headers)
+                                .await
+                                .map_err(|e| Error::Other(format!("failed to discover OIDC provider metadata: {e}")))?;
 
                             let mut secret_data = BTreeMap::new();
                             secret_data.insert("zitadel_organization_id".to_string(), proj.organization_id.clone());
@@ -692,11 +688,9 @@ async fn reconcile(app: Arc<Application>, ctx: Arc<OperatorContext>) -> Result<A
                                 _ => unreachable!("SAML not supported"),
                             };
 
-                            let issuer = management.get_oidc_information(GetOidcInformationRequest {}).await?.into_inner().issuer;
-                            let discovery = CoreProviderMetadata::discover_async(
-                                IssuerUrl::new(issuer).map_err(|e| Error::Other(format!("failed to discover OIDC provider metadata: {:?}", e)))?,
-                                async_http_client
-                            ).await.map_err(|e| Error::Other(format!("failed to discover OIDC provider metadata: {:?}", e)))?;
+                            let discovery = crate::discover_metadata(ctx.zitadel.url(), &ctx.custom_headers)
+                                .await
+                                .map_err(|e| Error::Other(format!("failed to discover OIDC provider metadata: {e}")))?;
 
                             let mut secret_data = BTreeMap::new();
                             secret_data.insert("zitadel_organization_id".to_string(), proj.organization_id.clone());
