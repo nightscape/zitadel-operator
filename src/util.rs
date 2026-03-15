@@ -1,4 +1,4 @@
-use crate::Result;
+use crate::{Error, Result};
 use kube::{
     api::{Patch, PatchParams},
     Api, Resource, ResourceExt,
@@ -10,7 +10,8 @@ use serde::{
 };
 use serde_json::json;
 use std::{env, fmt::Debug, sync::Arc};
-use tonic::Request;
+use tonic::{Code, Request};
+use tracing::debug;
 
 const DEFAULT_REQUEUE_SECS: u64 = 300;
 
@@ -111,7 +112,14 @@ impl<Parent: Resource + DeserializeOwned + Clone + Debug + IsReady + GetStatus, 
             Some(parent) => match parent.get_status() {
                 Some(parent_status) if parent.is_ready() => {
                     if let Some(status) = parameters.resource.get_status() {
-                        let resp = parameters.retriever.get_object(&status).await?;
+                        let resp = match parameters.retriever.get_object(&status).await {
+                            Ok(resp) => resp,
+                            Err(Error::ZitadelError(e)) if e.code() == Code::NotFound => {
+                                debug!("stored ID not found in Zitadel, falling back to name-based lookup");
+                                None
+                            }
+                            Err(e) => return Err(e),
+                        };
                         if let Some(resp) = resp {
                             if (parameters.is_equal)(&resp, &parameters.resource) {
                                 return Ok(Self::ExistsEqual(resp, parent_status.clone()));
