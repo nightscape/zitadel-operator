@@ -13,6 +13,16 @@ pub struct ProjectSpec {
     pub organization_name: String,
     #[serde(default)]
     pub project_role_assertion: bool,
+    /// Zitadel "Check authorization on Authentication": when true, a user must
+    /// hold a role grant on this project to complete authentication. This is the
+    /// tenant-isolation gate — without it, any authenticated instance user can
+    /// log in to any tenant's app.
+    #[serde(default)]
+    pub project_role_check: bool,
+    /// Zitadel "Check for Project on Authentication": when true, the user's
+    /// organization must have a grant for this project to authenticate.
+    #[serde(default)]
+    pub has_project_check: bool,
 }
 #[derive(Deserialize, Serialize, Clone, Default, Debug, JsonSchema)]
 #[serde(rename_all = "camelCase")]

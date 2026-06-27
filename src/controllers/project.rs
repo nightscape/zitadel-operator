@@ -106,6 +106,8 @@ async fn reconcile(proj: Arc<Project>, ctx: Arc<OperatorContext>) -> Result<Acti
                         is_equal: |object, proj| {
                         object.name == proj.spec.name
                             && object.project_role_assertion == proj.spec.project_role_assertion
+                            && object.project_role_check == proj.spec.project_role_check
+                            && object.has_project_check == proj.spec.has_project_check
                     },
                     },
                 )
@@ -122,8 +124,8 @@ async fn reconcile(proj: Arc<Project>, ctx: Arc<OperatorContext>) -> Result<Acti
                                     id: project.id,
                                     name: proj.spec.name.clone(),
                                     project_role_assertion: proj.spec.project_role_assertion,
-                                    project_role_check: project.project_role_check,
-                                    has_project_check: project.has_project_check,
+                                    project_role_check: proj.spec.project_role_check,
+                                    has_project_check: proj.spec.has_project_check,
                                     private_labeling_setting: project.private_labeling_setting,
                                 },
                                 org.id,
@@ -154,8 +156,8 @@ async fn reconcile(proj: Arc<Project>, ctx: Arc<OperatorContext>) -> Result<Acti
                                 AddProjectRequest {
                                     name: proj.spec.name.clone(),
                                     project_role_assertion: proj.spec.project_role_assertion,
-                                    project_role_check: false,
-                                    has_project_check: false,
+                                    project_role_check: proj.spec.project_role_check,
+                                    has_project_check: proj.spec.has_project_check,
                                     private_labeling_setting: PrivateLabelingSetting::Unspecified.into(),
                                 },
                                 org.id.clone(),
