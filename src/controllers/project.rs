@@ -46,7 +46,10 @@ impl CurrentStateRetriever<Project, zitadel::api::zitadel::project::v1::Project,
     ) -> Result<Option<zitadel::api::zitadel::project::v1::Project>> {
         Ok(self
             .management
-            .get_project_by_id(GetProjectByIdRequest { id: status.id.clone() })
+            .get_project_by_id(create_request_with_org_id(
+                GetProjectByIdRequest { id: status.id.clone() },
+                status.organization_id.clone(),
+            ))
             .await?
             .into_inner()
             .project)
