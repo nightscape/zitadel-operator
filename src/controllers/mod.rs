@@ -1,5 +1,6 @@
 pub mod application;
 pub mod human_user;
+pub mod machine_user;
 pub mod organization;
 pub mod project;
 pub mod project_role;
