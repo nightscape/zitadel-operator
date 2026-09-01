@@ -13,7 +13,7 @@ use futures::StreamExt;
 use kube::{
     runtime::{
         controller::Action,
-        events::{Event, EventType},
+        events::{Event, EventType, Recorder},
         finalizer::{finalizer, Event as Finalizer},
         metadata_watcher,
         reflector::{Lookup, ObjectRef},
@@ -26,11 +26,14 @@ use std::{sync::Arc, time::Duration};
 use tonic::{service::interceptor::InterceptedService, Code};
 use tracing::{debug, info, instrument, warn};
 use zitadel::api::zitadel::{
-    idp::v1::{idp::Config as IdpConfig, Idp, IdpFieldName, IdpNameQuery, IdpStylingType},
+    idp::v1::{
+        idp::Config as IdpConfig, Idp, IdpFieldName, IdpNameQuery, IdpOwnerType, IdpStylingType,
+    },
     management::v1::{
-        idp_query, management_service_client::ManagementServiceClient, AddOrgJwtidpRequest,
-        GetOrgIdpByIdRequest, IdpQuery, ListOrgIdPsRequest, RemoveOrgIdpRequest, UpdateOrgIdpRequest,
-        UpdateOrgIdpjwtConfigRequest,
+        idp_query, management_service_client::ManagementServiceClient, AddIdpToLoginPolicyRequest,
+        AddOrgJwtidpRequest, GetOrgIdpByIdRequest, IdpQuery, ListLoginPolicyIdPsRequest,
+        ListOrgIdPsRequest, RemoveIdpFromLoginPolicyRequest, RemoveOrgIdpRequest,
+        UpdateOrgIdpRequest, UpdateOrgIdpjwtConfigRequest,
     },
     v1::TextQueryMethod,
 };
@@ -50,6 +53,110 @@ fn matches_spec(object: &Idp, idp: &IdentityProvider) -> bool {
         && config.jwt_endpoint == jwt.jwt_endpoint.as_str()
         && config.keys_endpoint == jwt.keys_endpoint.as_str()
         && config.header_name == jwt.header_name
+}
+
+type Management =
+    ManagementServiceClient<InterceptedService<tonic::transport::Channel, CustomHeaderInterceptor>>;
+
+/// Membership of the organization's login policy, which is what actually makes
+/// a provider appear on the login screen.
+///
+/// Zitadel refuses this write for an organization still inheriting the instance
+/// default policy. Creating a custom one to get past that would silently take
+/// over every other login setting for the organization, so the operator reports
+/// the situation instead and leaves the choice with whoever owns the tenant.
+async fn reconcile_login_screen(
+    management: &mut Management,
+    recorder: &Recorder,
+    idp: &IdentityProvider,
+    idp_id: &str,
+    org_id: &str,
+) -> Result<()> {
+    let listed = management
+        .list_login_policy_id_ps(create_request_with_org_id(
+            ListLoginPolicyIdPsRequest { query: None },
+            org_id.to_string(),
+        ))
+        .await?
+        .into_inner()
+        .result;
+    let on_screen = listed.iter().any(|link| link.idp_id == idp_id);
+
+    if on_screen == idp.spec.show_on_login_screen {
+        return Ok(());
+    }
+
+    let resp = if idp.spec.show_on_login_screen {
+        management
+            .add_idp_to_login_policy(create_request_with_org_id(
+                AddIdpToLoginPolicyRequest {
+                    idp_id: idp_id.to_string(),
+                    owner_type: IdpOwnerType::Org.into(),
+                },
+                org_id.to_string(),
+            ))
+            .await
+            .map(|_| ())
+    } else {
+        management
+            .remove_idp_from_login_policy(create_request_with_org_id(
+                RemoveIdpFromLoginPolicyRequest {
+                    idp_id: idp_id.to_string(),
+                },
+                org_id.to_string(),
+            ))
+            .await
+            .map(|_| ())
+    };
+
+    match resp {
+        Ok(()) => {
+            let (reason, note) = if idp.spec.show_on_login_screen {
+                ("OfferedOnLoginScreen", "Provider added to the login policy")
+            } else {
+                ("WithdrawnFromLoginScreen", "Provider removed from the login policy")
+            };
+            debug!("{note}");
+            recorder
+                .publish(
+                    &Event {
+                        type_: EventType::Normal,
+                        reason: reason.to_string(),
+                        note: Some(note.to_string()),
+                        action: "Updating".to_string(),
+                        secondary: None,
+                    },
+                    &idp.object_ref(&()),
+                )
+                .await?;
+            Ok(())
+        }
+        // Org-Ffgw2 is Zitadel's "this organization has no login policy of its
+        // own", the state every organization starts in.
+        Err(e) if e.code() == Code::NotFound && e.message().contains("Org-Ffgw2") => {
+            let note = format!(
+                "Organization {} inherits the instance default login policy, so the provider \
+                 cannot be offered on its login screen. Give the organization a custom login \
+                 policy, or set showOnLoginScreen: false.",
+                idp.spec.organization_name
+            );
+            warn!("{note}");
+            recorder
+                .publish(
+                    &Event {
+                        type_: EventType::Warning,
+                        reason: "NoCustomLoginPolicy".to_string(),
+                        note: Some(note.clone()),
+                        action: "NotOffered".to_string(),
+                        secondary: None,
+                    },
+                    &idp.object_ref(&()),
+                )
+                .await?;
+            Err(Error::Other(note))
+        }
+        Err(e) => Err(Error::ZitadelError(e)),
+    }
 }
 
 struct IdentityProviderStateRetriever {
@@ -123,10 +230,13 @@ async fn reconcile(idp: Arc<IdentityProvider>, ctx: Arc<OperatorContext>) -> Res
                 })
                 .await?;
 
-                match state {
-                    CurrentState::ExistsEqual(_, _) => {}
+                // The provider's own id and org, once it is known to exist.
+                let ensured = match state {
+                    CurrentState::ExistsEqual(object, org) => Some((object.id, org.id)),
                     CurrentState::ExistsUnequal(object, org) => {
                         debug!("identity provider changed, updating");
+
+                        let org_id = org.id.clone();
 
                         // Zitadel splits the provider across two calls: the
                         // envelope carries name and auto-register, the config
@@ -168,6 +278,8 @@ async fn reconcile(idp: Arc<IdentityProvider>, ctx: Arc<OperatorContext>) -> Res
                                 &idp.object_ref(&()),
                             )
                             .await?;
+
+                        Some((object.id, org_id))
                     }
                     CurrentState::NotExists(org) => {
                         debug!("identity provider not found, (re)creating");
@@ -188,12 +300,15 @@ async fn reconcile(idp: Arc<IdentityProvider>, ctx: Arc<OperatorContext>) -> Res
                             .await?
                             .into_inner();
 
+                        let idp_id = resp.idp_id;
+                        let org_id = org.id;
+
                         patch_status(
                             &idps,
                             idp.as_ref(),
                             IdentityProviderStatus {
-                                id: resp.idp_id,
-                                organization_id: org.id,
+                                id: idp_id.clone(),
+                                organization_id: org_id.clone(),
                                 phase: IdentityProviderPhase::Ready,
                             },
                         )
@@ -211,6 +326,8 @@ async fn reconcile(idp: Arc<IdentityProvider>, ctx: Arc<OperatorContext>) -> Res
                                 &idp.object_ref(&()),
                             )
                             .await?;
+
+                        Some((idp_id, org_id))
                     }
                     CurrentState::ParentNotFound => {
                         info!("organization {} not found", idp.spec.organization_name);
@@ -227,6 +344,8 @@ async fn reconcile(idp: Arc<IdentityProvider>, ctx: Arc<OperatorContext>) -> Res
                                 &idp.object_ref(&()),
                             )
                             .await?;
+
+                        None
                     }
                     CurrentState::ParentNotReady(_) => {
                         info!("organization {} not ready", idp.spec.organization_name);
@@ -243,16 +362,20 @@ async fn reconcile(idp: Arc<IdentityProvider>, ctx: Arc<OperatorContext>) -> Res
                                 &idp.object_ref(&()),
                             )
                             .await?;
+
+                        None
                     }
                     CurrentState::FoundAdoptable(object, org) => {
                         debug!("identity provider found, attaching id to resource");
+
+                        let org_id = org.id;
 
                         patch_status(
                             &idps,
                             idp.as_ref(),
                             IdentityProviderStatus {
                                 id: object.id.clone(),
-                                organization_id: org.id,
+                                organization_id: org_id.clone(),
                                 phase: IdentityProviderPhase::Ready,
                             },
                         )
@@ -270,7 +393,13 @@ async fn reconcile(idp: Arc<IdentityProvider>, ctx: Arc<OperatorContext>) -> Res
                                 &idp.object_ref(&()),
                             )
                             .await?;
+
+                        Some((object.id, org_id))
                     }
+                };
+
+                if let Some((idp_id, org_id)) = ensured {
+                    reconcile_login_screen(&mut management, &recorder, &idp, &idp_id, &org_id).await?;
                 }
 
                 Ok(Action::requeue(Duration::from_secs(requeue_secs())))

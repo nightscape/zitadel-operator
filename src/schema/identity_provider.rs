@@ -20,8 +20,20 @@ pub struct IdentityProviderSpec {
     /// federation builds a second one beside it.
     #[serde(default)]
     pub auto_register: bool,
+    /// Offer this provider on the organization's login screen.
+    ///
+    /// Zitadel keeps provider configuration and login-screen membership apart,
+    /// so a provider that is not on the login policy is configured correctly
+    /// and still invisible. Defaulting this on makes that state something you
+    /// have to ask for rather than something you fall into.
+    #[serde(default = "yes")]
+    pub show_on_login_screen: bool,
     #[serde(flatten)]
     pub(crate) inner: IdentityProviderInnerSpec,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
