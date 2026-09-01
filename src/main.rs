@@ -10,8 +10,8 @@ use zitadel::{
 };
 use zitadel_operator::{
     controllers::{
-        application, email_provider_smtp, human_user, machine_user, organization, project,
-        project_role, user_grant,
+        application, email_provider_smtp, human_user, identity_provider, machine_user,
+        organization, project, project_role, user_grant,
     },
     OperatorContext, ZitadelBuilder,
 };
@@ -139,6 +139,7 @@ async fn main() -> anyhow::Result<()> {
     let application_controller = application::run(context.clone());
     let machine_user_controller = machine_user::run(context.clone());
     let email_provider_smtp_controller = email_provider_smtp::run(context.clone());
+    let identity_provider_controller = identity_provider::run(context.clone());
 
     tokio::join!(
         organization_controller,
@@ -148,7 +149,8 @@ async fn main() -> anyhow::Result<()> {
         user_grant_controller,
         application_controller,
         machine_user_controller,
-        email_provider_smtp_controller
+        email_provider_smtp_controller,
+        identity_provider_controller
     );
 
     Ok(())
