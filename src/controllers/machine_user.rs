@@ -26,7 +26,7 @@ use zitadel::api::zitadel::{
     management::v1::{
         AddMachineKeyRequest, AddMachineUserRequest, AddOrgMemberRequest, GetUserByIdRequest,
         ListOrgMembersRequest, ListUsersRequest, RemoveMachineKeyRequest, RemoveUserRequest,
-        UpdateOrgMemberRequest,
+        UpdateOrgMemberRequest, UpdateUserNameRequest,
     },
     user::v1::{search_query, AccessTokenType, SearchQuery, UserNameQuery},
 };
@@ -79,6 +79,10 @@ async fn reconcile(mu: Arc<MachineUser>, ctx: Arc<OperatorContext>) -> Result<Ac
 
                 // --- 1. resolve or create the machine user -> user_id ---
                 let mut user_id: Option<String> = None;
+                // Set only when the account was resolved by stored id, the one
+                // path that can hand back an account whose username has drifted
+                // from the spec.
+                let mut current_username: Option<String> = None;
 
                 if let Some(status) = &mu.status {
                     if !status.id.is_empty() {
@@ -90,8 +94,9 @@ async fn reconcile(mu: Arc<MachineUser>, ctx: Arc<OperatorContext>) -> Result<Ac
                             .await
                         {
                             Ok(resp) => {
-                                if resp.into_inner().user.is_some() {
+                                if let Some(user) = resp.into_inner().user {
                                     user_id = Some(status.id.clone());
+                                    current_username = Some(user.user_name);
                                 }
                             }
                             Err(e) if e.code() == Code::NotFound => {
@@ -128,7 +133,7 @@ async fn reconcile(mu: Arc<MachineUser>, ctx: Arc<OperatorContext>) -> Result<Ac
 
                 if user_id.is_none() {
                     debug!("machine user not found, creating");
-                    let resp = management
+                    let resp = match management
                         .add_machine_user(create_request_with_org_id(
                             AddMachineUserRequest {
                                 user_name: mu.spec.username.clone(),
@@ -139,8 +144,40 @@ async fn reconcile(mu: Arc<MachineUser>, ctx: Arc<OperatorContext>) -> Result<Ac
                             },
                             org_id.clone(),
                         ))
-                        .await?
-                        .into_inner();
+                        .await
+                    {
+                        Ok(resp) => resp.into_inner(),
+                        // The search above looked inside this organization and
+                        // found nothing, so an AlreadyExists here means another
+                        // organization holds the name: usernames are unique
+                        // instance-wide unless userLoginMustBeDomain is set.
+                        // Adopting that account would hand this tenant another
+                        // tenant's credential, so say so and stop.
+                        Err(e) if e.code() == Code::AlreadyExists => {
+                            let note = format!(
+                                "Username {} is taken in another organization, so {} cannot \
+                                 create it. Zitadel usernames are unique across the instance \
+                                 unless userLoginMustBeDomain is set. Give this service account \
+                                 a username unique to its tenant.",
+                                mu.spec.username, mu.spec.organization_name
+                            );
+                            warn!("{note}");
+                            recorder
+                                .publish(
+                                    &Event {
+                                        type_: EventType::Warning,
+                                        reason: "UsernameTaken".to_string(),
+                                        note: Some(note.clone()),
+                                        action: "NotCreated".to_string(),
+                                        secondary: None,
+                                    },
+                                    &mu.object_ref(&()),
+                                )
+                                .await?;
+                            return Err(Error::Other(note));
+                        }
+                        Err(e) => return Err(Error::ZitadelError(e)),
+                    };
                     user_id = Some(resp.user_id);
                     recorder
                         .publish(
@@ -156,6 +193,67 @@ async fn reconcile(mu: Arc<MachineUser>, ctx: Arc<OperatorContext>) -> Result<Ac
                         .await?;
                 }
                 let user_id = user_id.unwrap();
+
+                // --- 1b. the username itself is spec, not just a lookup key ---
+                // Without this the account keeps whatever name it was created
+                // with, and a changed spec drifts silently until something forces
+                // a re-create — which then builds a second account and orphans
+                // this one.
+                if let Some(actual) = current_username {
+                    if actual != mu.spec.username {
+                        debug!("username drifted, renaming {} -> {}", actual, mu.spec.username);
+                        match management
+                            .update_user_name(create_request_with_org_id(
+                                UpdateUserNameRequest {
+                                    user_id: user_id.clone(),
+                                    user_name: mu.spec.username.clone(),
+                                },
+                                org_id.clone(),
+                            ))
+                            .await
+                        {
+                            Ok(_) => {
+                                recorder
+                                    .publish(
+                                        &Event {
+                                            type_: EventType::Normal,
+                                            reason: "Renamed".to_string(),
+                                            note: Some(format!(
+                                                "Username changed from {} to {}",
+                                                actual, mu.spec.username
+                                            )),
+                                            action: "Updating".to_string(),
+                                            secondary: None,
+                                        },
+                                        &mu.object_ref(&()),
+                                    )
+                                    .await?;
+                            }
+                            Err(e) if e.code() == Code::AlreadyExists => {
+                                let note = format!(
+                                    "Cannot rename {} to {}: that username is taken in another \
+                                     organization.",
+                                    actual, mu.spec.username
+                                );
+                                warn!("{note}");
+                                recorder
+                                    .publish(
+                                        &Event {
+                                            type_: EventType::Warning,
+                                            reason: "UsernameTaken".to_string(),
+                                            note: Some(note.clone()),
+                                            action: "NotRenamed".to_string(),
+                                            secondary: None,
+                                        },
+                                        &mu.object_ref(&()),
+                                    )
+                                    .await?;
+                                return Err(Error::Other(note));
+                            }
+                            Err(e) => return Err(Error::ZitadelError(e)),
+                        }
+                    }
+                }
 
                 // persist id early (idempotency); carry existing key_id forward
                 let current_key_id = mu.status.as_ref().map(|s| s.key_id.clone()).unwrap_or_default();
