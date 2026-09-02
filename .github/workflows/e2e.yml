@@ -15,9 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
-    # Every test step pipes into tee. GitHub's default shell is `bash -e`
-    # without pipefail, so the pipe returns tee's status and a failing suite
-    # reported success: the run on 3da09ebe was red and shown as green.
+    # Every test step pipes into tee. GitHub's default shell has no pipefail, so
+    # the pipe would report tee's status; an explicit `bash` shell turns it on.
     defaults:
       run:
         shell: bash
@@ -53,10 +52,13 @@ jobs:
       # only a running instance can settle, so this suite is the one place they
       # are checked against a real one.
       - name: Run action handler e2e tests
+        # Runs even when the suite above fails, so that these two suites report
+        # on each other's behalf rather than one hiding the other.
+        if: always()
         run: cargo test --test e2e_actions -- --nocapture 2>&1 | tee -a e2e-output.log
 
       - name: Upload test output
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: e2e-test-logs

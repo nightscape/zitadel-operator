@@ -53,9 +53,7 @@ impl ActionsApi {
             return Ok(None);
         }
         if !status.is_success() {
-            return Err(Error::Other(format!(
-                "Zitadel actions API {path} returned HTTP {status}: {text}"
-            )));
+            return Err(api_error(path, status, &text));
         }
         serde_json::from_str(&text)
             .map(Some)
@@ -116,9 +114,7 @@ impl ActionsApi {
         else {
             return Ok(None);
         };
-        serde_json::from_value(body["target"].clone())
-            .map(Some)
-            .map_err(|e| Error::Other(format!("unexpected target: {e}")))
+        parse_target(&body).map(Some)
     }
 
     pub async fn find_target_by_name(&self, name: &str) -> Result<Option<Target>> {
@@ -132,18 +128,7 @@ impl ActionsApi {
             )
             .await?
             .ok_or_else(|| Error::Other("target search returned no body".to_string()))?;
-        // Zitadel leaves the list out of the response entirely when nothing
-        // matches, so "no targets" arrives as an absent key rather than [].
-        let targets: Vec<Target> = serde_json::from_value::<Option<Vec<Target>>>(
-            body["targets"].clone(),
-        )
-        .map_err(|e| Error::Other(format!("unexpected target search result: {e}")))?
-        .unwrap_or_default();
-        match targets.len() {
-            0 => Ok(None),
-            1 => Ok(targets.into_iter().next()),
-            n => Err(Error::Other(format!("found {n} action targets named {name}"))),
-        }
+        single_target(parse_list(&body, "targets")?, name)
     }
 
     pub async fn delete_target(&self, id: &str) -> Result<()> {
@@ -163,6 +148,38 @@ impl ActionsApi {
         .await?;
         Ok(())
     }
+}
+
+/// A list in a search response.
+///
+/// Zitadel leaves the key out entirely when nothing matched rather than sending
+/// an empty list, so every search response has to treat an absent key as "none"
+/// instead of as a malformed body.
+fn parse_list<T: serde::de::DeserializeOwned>(body: &Value, field: &str) -> Result<Vec<T>> {
+    serde_json::from_value::<Option<Vec<T>>>(body[field].clone())
+        .map(Option::unwrap_or_default)
+        .map_err(|e| Error::Other(format!("unexpected {field} in search result: {e}")))
+}
+
+fn parse_target(body: &Value) -> Result<Target> {
+    serde_json::from_value(body["target"].clone())
+        .map_err(|e| Error::Other(format!("unexpected target: {e}")))
+}
+
+fn single_target(targets: Vec<Target>, name: &str) -> Result<Option<Target>> {
+    match targets.len() {
+        0 => Ok(None),
+        1 => Ok(targets.into_iter().next()),
+        n => Err(Error::Other(format!("found {n} action targets named {name}"))),
+    }
+}
+
+/// Keeps Zitadel's own words, which carry the error id a reader needs to look
+/// the failure up.
+fn api_error(path: &str, status: StatusCode, body: &str) -> Error {
+    Error::Other(format!(
+        "Zitadel actions API {path} returned HTTP {status}: {body}"
+    ))
 }
 
 fn target_body(name: &str, endpoint: &str, wait_for_body: bool) -> Value {
