@@ -57,3 +57,7 @@ path = "tests/e2e_state_machine.rs"
 [[test]]
 name = "e2e_actions"
 path = "tests/e2e_actions.rs"
+
+[[test]]
+name = "e2e_identity_provider"
+path = "tests/e2e_identity_provider.rs"
