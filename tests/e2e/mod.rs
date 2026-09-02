@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use testcontainers::{core::{ContainerPort, WaitFor}, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt};
+use testcontainers::{core::{ContainerPort, Host, WaitFor}, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt};
 use tokio::process::Command;
 use tokio::sync::OnceCell;
 use tracing::info;
@@ -87,6 +87,9 @@ impl TestFixture {
             .with_wait_for(WaitFor::message_on_stderr("Node controller sync successful"));
 
         let k3s: ContainerAsync<GenericImage> = image
+            // Gives the container a hosts entry for the machine running these
+            // tests, which is the only address ZITADEL's pod can call back on.
+            .with_host("host.docker.internal", Host::HostGateway)
             .with_privileged(true)
             .with_userns_mode("host")
             .with_startup_timeout(Duration::from_secs(120))
@@ -145,7 +148,9 @@ impl TestFixture {
         // Install ZITADEL via Helm
         info!("Installing ZITADEL via Helm...");
         run_helm(&kubeconfig_path, &["repo", "add", "zitadel", "https://charts.zitadel.com"]).await?;
-        run_helm(&kubeconfig_path, &["repo", "update"]).await?;
+        // Named, because a bare update refreshes every repo the machine has and
+        // fails the run over one this fixture does not use.
+        run_helm(&kubeconfig_path, &["repo", "update", "zitadel"]).await?;
 
         let zitadel_values = include_str!("../fixtures/e2e-zitadel-values.yaml")
             .replace("ExternalPort: 8080", &format!("ExternalPort: {}", zitadel_host_port));
@@ -181,6 +186,7 @@ impl TestFixture {
 
         info!("Waiting for ZITADEL to be ready...");
         wait_for_zitadel_ready_default_ns(&k8s_client).await?;
+        wait_for_discovery(&zitadel_url).await?;
         info!("ZITADEL available at {}", zitadel_url);
 
         // Get the service account JSON from the secret created by Helm
@@ -291,6 +297,59 @@ impl TestFixture {
         }
         Ok(())
     }
+}
+
+/// Polls OIDC discovery until it answers.
+///
+/// A ready deployment does not mean the node port routes to it yet, and the
+/// first client this fixture builds goes straight to discovery.
+async fn wait_for_discovery(zitadel_url: &str) -> Result<()> {
+    // ZITADEL is configured with ExternalDomain "localhost" and checks the Host
+    // header, so probing 127.0.0.1 asks it about a domain it does not serve.
+    let discovery = format!("{zitadel_url}/.well-known/openid-configuration");
+    let client = reqwest::Client::new();
+    let mut last = String::from("never attempted");
+    for attempt in 1..=60 {
+        match client.get(&discovery).timeout(Duration::from_secs(5)).send().await {
+            Ok(response) if response.status().is_success() => {
+                info!("OIDC discovery answered on attempt {attempt}");
+                return Ok(());
+            }
+            Ok(response) => last = format!("HTTP {}", response.status()),
+            Err(e) => last = e.to_string(),
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    Err(anyhow!("{discovery} never answered; last attempt said: {last}"))
+}
+
+/// Address of the machine running these tests, as a pod inside the cluster can
+/// reach it.
+///
+/// Resolved inside the container rather than assumed, because the answer is a
+/// property of the container runtime: Docker maps `host-gateway` to the bridge,
+/// while OrbStack answers with an address of its own. The container's own
+/// network gateway is not it — on some runtimes nothing listens there.
+pub fn host_address() -> Result<String> {
+    let id = CONTAINER_ID
+        .get()
+        .ok_or_else(|| anyhow!("the k3s container has not been started"))?;
+    // Read from /etc/hosts, where --add-host put it. The k3s image has neither
+    // getent nor nslookup, and a resolver would answer from the runtime's own
+    // DNS rather than from the mapping this container was given.
+    let output = std::process::Command::new("docker")
+        .args(["exec", id, "cat", "/etc/hosts"])
+        .output()?;
+    let hosts = String::from_utf8(output.stdout)?;
+    let address = hosts
+        .lines()
+        .find(|line| line.split_whitespace().any(|f| f == "host.docker.internal"))
+        .and_then(|line| line.split_whitespace().next())
+        .filter(|a| a.parse::<std::net::Ipv4Addr>().is_ok())
+        .ok_or_else(|| {
+            anyhow!("the container has no host.docker.internal entry; /etc/hosts was:\n{hosts}")
+        })?;
+    Ok(address.to_string())
 }
 
 extern "C" fn remove_container_on_exit() {

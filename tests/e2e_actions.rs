@@ -11,12 +11,18 @@ mod e2e;
 
 use anyhow::{anyhow, Context, Result};
 use e2e::TestFixture;
+use k8s_openapi::api::core::v1::Event;
 use kube::{
-    api::{DeleteParams, Patch, PatchParams},
+    api::{DeleteParams, ListParams, Patch, PatchParams},
     Api,
 };
 use serde_json::{json, Value};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use axum::{response::IntoResponse, Router};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use zitadel::api::zitadel::{
     idp::v1::IdpStylingType,
     management::v1::AddOrgJwtidpRequest,
@@ -32,6 +38,11 @@ use zitadel_operator::{
 const NAMESPACE: &str = "default";
 const HANDLER: &str = "fill-idp-username";
 const PORT: u16 = 18090;
+/// ZITADEL is pointed here rather than straight at the operator, so that the
+/// test can tell "ZITADEL never called us" apart from "ZITADEL called us and the
+/// handler misbehaved". Those two produce the same downstream error, which made
+/// earlier failures unreadable.
+const PROXY_PORT: u16 = 18091;
 
 const FILL_USERNAME: &str = r#"
 if (.request.idpLinks[0].userName // "") == "" then
@@ -50,9 +61,14 @@ async fn action_handler_repairs_a_request_zitadel_would_reject() -> Result<()> {
 
     // Zitadel runs as a pod inside the k3s container and has to reach this test
     // process on the host, which it can only do through the container's gateway.
-    let host = docker_gateway().context("cannot determine the docker gateway")?;
+    // Two addresses, two directions: ZITADEL reaches this process from inside the
+    // cluster, while this process reaches its own server on loopback.
+    let host = e2e::host_address().context("cannot determine the host address")?;
     std::env::set_var("ACTION_HANDLER_PORT", PORT.to_string());
-    std::env::set_var("ACTION_HANDLER_URL", format!("http://{host}:{PORT}"));
+    std::env::set_var("ACTION_HANDLER_URL", format!("http://{host}:{PROXY_PORT}"));
+
+    let seen = Seen::default();
+    start_probe_proxy(seen.clone()).await?;
 
     let ctx = Arc::new(OperatorContext {
         k8s: fixture.k8s_client.clone(),
@@ -63,14 +79,14 @@ async fn action_handler_repairs_a_request_zitadel_would_reject() -> Result<()> {
     });
     tokio::spawn(action_handler::run(ctx.clone()));
     tokio::spawn(actions::run(ctx.clone()));
-    await_health(host.as_str()).await?;
+    await_health().await?;
 
     let idp_id = create_jwt_idp(fixture).await?;
 
     let handlers: Api<ActionHandler> = Api::namespaced(fixture.k8s_client.clone(), NAMESPACE);
     let _ = handlers.delete(HANDLER, &DeleteParams::default()).await;
     apply_handler(&handlers).await?;
-    let status = await_ready(&handlers).await?;
+    let status = await_ready(fixture, &handlers).await?;
 
     let target_id = status["targetId"].as_str().unwrap().to_string();
     assert!(!target_id.is_empty(), "handler became ready without a target");
@@ -81,7 +97,7 @@ async fn action_handler_repairs_a_request_zitadel_would_reject() -> Result<()> {
         .await
         .map_err(|e| anyhow!("{e:?}"))?
         .ok_or_else(|| anyhow!("Zitadel does not know target {target_id}"))?;
-    assert_eq!(target.endpoint, format!("http://{host}:{PORT}/handlers/{NAMESPACE}/{HANDLER}"));
+    assert_eq!(target.endpoint, format!("http://{host}:{PROXY_PORT}/handlers/{NAMESPACE}/{HANDLER}"));
     assert_eq!(target.name, format!("k8s/{NAMESPACE}/{HANDLER}"));
 
     // The operator must hold the signing key, or every call it gets is
@@ -95,10 +111,24 @@ async fn action_handler_repairs_a_request_zitadel_would_reject() -> Result<()> {
     let created = match created {
         Ok(created) => created,
         Err(e) => panic!(
-            "the handler did not repair the request: {e}\n\
-             (if this is a connection error, Zitadel could not reach {host}:{PORT})"
+            "the handler did not repair the request: {e}\n{}",
+            seen.report(&host)
         ),
     };
+
+    // The envelope ZITADEL sends is the contract this operator is written
+    // against, and a version upgrade is exactly when it would move.
+    let envelope = seen.first().expect("the proxy recorded no call");
+    for key in ["fullMethod", "orgID", "request"] {
+        assert!(
+            envelope.get(key).is_some(),
+            "ZITADEL's payload no longer carries {key}: {envelope}"
+        );
+    }
+    assert_eq!(
+        envelope["fullMethod"],
+        json!("/zitadel.user.v2.UserService/AddHumanUser")
+    );
 
     // Succeeding only proves something made the request valid. Reading the link
     // back proves the transform's own output landed: Zitadel stored the external
@@ -133,6 +163,79 @@ async fn action_handler_repairs_a_request_zitadel_would_reject() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Records every call ZITADEL makes and passes it through untouched.
+#[derive(Clone, Default)]
+struct Seen(Arc<Mutex<Vec<Value>>>);
+
+impl Seen {
+    fn first(&self) -> Option<Value> {
+        self.0.lock().unwrap().first().cloned()
+    }
+
+    /// What to say about a failure, which turns on whether ZITADEL called at all.
+    fn report(&self, host: &str) -> String {
+        let calls = self.0.lock().unwrap();
+        match calls.len() {
+            0 => format!(
+                "ZITADEL never called the handler: nothing reached {host}:{PROXY_PORT}. \
+                 The target is registered, so this is reachability, not the handler."
+            ),
+            n => format!(
+                "ZITADEL called the handler {n} time(s), so the handler itself is at \
+                 fault. First payload: {}",
+                calls[0]
+            ),
+        }
+    }
+}
+
+/// Forwards to the operator's own server, recording bodies on the way through.
+/// The method, body and headers are passed on unchanged so that the signature
+/// ZITADEL computed still verifies.
+async fn start_probe_proxy(seen: Seen) -> Result<()> {
+    let router = Router::new()
+        .fallback(axum::routing::any(proxy))
+        .with_state(seen);
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", PROXY_PORT)).await?;
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("proxy stopped");
+    });
+    Ok(())
+}
+
+async fn proxy(
+    axum::extract::State(seen): axum::extract::State<Seen>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    if let Ok(payload) = serde_json::from_slice::<Value>(&body) {
+        seen.0.lock().unwrap().push(payload);
+    }
+
+    let path = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let response = reqwest::Client::new()
+        .request(method, format!("http://127.0.0.1:{PORT}{path}"))
+        .headers(headers)
+        .body(body)
+        .send()
+        .await;
+
+    match response {
+        Ok(response) => {
+            let status = response.status();
+            let bytes = response.bytes().await.unwrap_or_default();
+            (status, bytes).into_response()
+        }
+        Err(e) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            format!("proxy could not reach the operator: {e}"),
+        )
+            .into_response(),
+    }
 }
 
 async fn apply_handler(handlers: &Api<ActionHandler>) -> Result<()> {
@@ -246,7 +349,7 @@ async fn idp_link_username(fixture: &TestFixture, user_id: &str) -> Result<Strin
     }
 }
 
-async fn await_ready(handlers: &Api<ActionHandler>) -> Result<Value> {
+async fn await_ready(fixture: &TestFixture, handlers: &Api<ActionHandler>) -> Result<Value> {
     for _ in 0..60 {
         if let Some(handler) = handlers.get_opt(HANDLER).await? {
             if let Some(status) = handler.status {
@@ -255,7 +358,36 @@ async fn await_ready(handlers: &Api<ActionHandler>) -> Result<Value> {
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    Err(anyhow!("ActionHandler {HANDLER} never reported a status"))
+    // A handler that never reconciles has already said why on its events, and
+    // without them this failure is a bare timeout that names nothing.
+    Err(anyhow!(
+        "ActionHandler {HANDLER} never reported a status. Events: {}",
+        handler_events(fixture).await
+    ))
+}
+
+/// What the operator recorded against the handler, newest last.
+async fn handler_events(fixture: &TestFixture) -> String {
+    let events: Api<Event> = Api::namespaced(fixture.k8s_client.clone(), NAMESPACE);
+    let listed = events
+        .list(&ListParams::default().fields(&format!("involvedObject.name={HANDLER}")))
+        .await;
+    match listed {
+        Ok(list) if list.items.is_empty() => "(none recorded)".to_string(),
+        Ok(list) => list
+            .items
+            .iter()
+            .map(|e| {
+                format!(
+                    "[{}] {}",
+                    e.reason.clone().unwrap_or_default(),
+                    e.message.clone().unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; "),
+        Err(e) => format!("(could not read events: {e})"),
+    }
 }
 
 async fn await_gone(handlers: &Api<ActionHandler>) -> Result<()> {
@@ -268,11 +400,11 @@ async fn await_gone(handlers: &Api<ActionHandler>) -> Result<()> {
     Err(anyhow!("ActionHandler {HANDLER} was never removed"))
 }
 
-async fn await_health(host: &str) -> Result<()> {
+async fn await_health() -> Result<()> {
     let client = reqwest::Client::new();
     for _ in 0..30 {
         if client
-            .get(format!("http://{host}:{PORT}/healthz"))
+            .get(format!("http://127.0.0.1:{PORT}/healthz"))
             .send()
             .await
             .is_ok()
@@ -281,24 +413,5 @@ async fn await_health(host: &str) -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    Err(anyhow!("the action handler server never came up on {host}:{PORT}"))
-}
-
-/// Address of the host as seen from inside the k3s container, and therefore
-/// from the Zitadel pod that NATs out through it.
-fn docker_gateway() -> Result<String> {
-    let output = std::process::Command::new("docker")
-        .args([
-            "network",
-            "inspect",
-            "bridge",
-            "-f",
-            "{{range .IPAM.Config}}{{.Gateway}}{{end}}",
-        ])
-        .output()?;
-    let gateway = String::from_utf8(output.stdout)?.trim().to_string();
-    if gateway.is_empty() {
-        return Err(anyhow!("docker's bridge network reports no gateway"));
-    }
-    Ok(gateway)
+    Err(anyhow!("the action handler server never came up on 127.0.0.1:{PORT}"))
 }
