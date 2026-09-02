@@ -10,6 +10,7 @@ use kube::{
     Api, Client, CustomResourceExt, ResourceExt,
 };
 use std::collections::HashMap;
+use std::env;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -26,7 +27,7 @@ use zitadel::api::zitadel::user::v1::AccessTokenType;
 use zitadel::credentials::{AuthenticationOptions, ServiceAccount};
 use zitadel_operator::{
     controllers::{application, human_user, organization, project, project_role, user_grant},
-    schema::{Application, HumanUser, Organization, Project, ProjectRole, UserGrant},
+    schema::{ActionHandler, Application, HumanUser, Organization, Project, ProjectRole, UserGrant},
     OperatorContext, ZitadelBuilder,
 };
 
@@ -37,6 +38,19 @@ const K3S_IMAGE: &str = "rancher/k3s";
 const K3S_TAG: &str = "v1.31.4-k3s1";
 const KUBE_SECURE_PORT: u16 = 6443;
 const E2E_CONTAINER_LABEL: &str = "zitadel-e2e-test";
+/// Chart 9.34.1 ships Zitadel v4.13.1, the version these tests make claims
+/// about. Override with ZITADEL_CHART_VERSION to run them against another one;
+/// `helm search repo zitadel/zitadel --versions` maps charts to Zitadel
+/// versions.
+///
+/// The chart carries the image, so pinning it pins Zitadel too. Letting the
+/// chart float puts a newer Zitadel beside an older Login UI, and the two then
+/// disagree until helm gives up waiting.
+const DEFAULT_ZITADEL_CHART_VERSION: &str = "9.34.1";
+
+fn zitadel_chart_version() -> String {
+    env::var("ZITADEL_CHART_VERSION").unwrap_or_else(|_| DEFAULT_ZITADEL_CHART_VERSION.to_string())
+}
 
 pub struct TestFixture {
     pub k8s_client: Client,
@@ -138,6 +152,8 @@ impl TestFixture {
         let values_path = conf_dir.join("zitadel-values.yaml");
         std::fs::write(&values_path, &zitadel_values)?;
 
+        let chart_version = zitadel_chart_version();
+        info!("Using ZITADEL chart {chart_version}");
         run_helm(
             &kubeconfig_path,
             &[
@@ -145,6 +161,7 @@ impl TestFixture {
                 "--namespace", "default",
                 "--wait",
                 "--timeout", "10m",
+                "--version", &chart_version,
                 "-f", values_path.to_str().unwrap(),
                 "zitadel/zitadel",
             ],
@@ -196,6 +213,7 @@ impl TestFixture {
             zitadel: zitadel_builder.clone(),
             operator_user_id: operator_user_id.clone(),
             custom_headers: HashMap::new(),
+            signing_keys: Default::default(),
         });
         start_controllers(ctx);
 
@@ -447,6 +465,7 @@ async fn apply_crds(client: &Client) -> Result<()> {
         HumanUser::crd(),
         UserGrant::crd(),
         Application::crd(),
+        ActionHandler::crd(),
     ];
 
     for crd in &crd_list {
