@@ -132,8 +132,13 @@ impl ActionsApi {
             )
             .await?
             .ok_or_else(|| Error::Other("target search returned no body".to_string()))?;
-        let targets: Vec<Target> = serde_json::from_value(body["targets"].clone())
-            .map_err(|e| Error::Other(format!("unexpected target search result: {e}")))?;
+        // Zitadel leaves the list out of the response entirely when nothing
+        // matches, so "no targets" arrives as an absent key rather than [].
+        let targets: Vec<Target> = serde_json::from_value::<Option<Vec<Target>>>(
+            body["targets"].clone(),
+        )
+        .map_err(|e| Error::Other(format!("unexpected target search result: {e}")))?
+        .unwrap_or_default();
         match targets.len() {
             0 => Ok(None),
             1 => Ok(targets.into_iter().next()),
