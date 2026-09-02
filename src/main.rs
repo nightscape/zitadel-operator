@@ -9,9 +9,10 @@ use zitadel::{
     credentials::{AuthenticationOptions, ServiceAccount},
 };
 use zitadel_operator::{
+    actions,
     controllers::{
-        application, email_provider_smtp, human_user, identity_provider, machine_user,
-        organization, project, project_role, user_grant,
+        action_handler, application, email_provider_smtp, human_user, identity_provider,
+        machine_user, organization, project, project_role, user_grant,
     },
     OperatorContext, ZitadelBuilder,
 };
@@ -128,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
         zitadel: zitadel_builder,
         operator_user_id,
         custom_headers,
+        signing_keys: actions::SigningKeys::default(),
     });
 
     info!("Starting controllers...");
@@ -140,6 +142,8 @@ async fn main() -> anyhow::Result<()> {
     let machine_user_controller = machine_user::run(context.clone());
     let email_provider_smtp_controller = email_provider_smtp::run(context.clone());
     let identity_provider_controller = identity_provider::run(context.clone());
+    let action_handler_controller = action_handler::run(context.clone());
+    let action_handler_server = actions::run(context.clone());
 
     tokio::join!(
         organization_controller,
@@ -150,7 +154,9 @@ async fn main() -> anyhow::Result<()> {
         application_controller,
         machine_user_controller,
         email_provider_smtp_controller,
-        identity_provider_controller
+        identity_provider_controller,
+        action_handler_controller,
+        action_handler_server
     );
 
     Ok(())

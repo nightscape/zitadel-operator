@@ -1,5 +1,10 @@
-image:
-  tag: "v4.10.0"
+# The chart version is pinned in mod.rs; the image comes with it, so that the
+# server and the Login UI can never disagree about their protocol.
+
+# Login V2 runs as its own deployment and needs a keypair the server accepts.
+# Nothing here drives a browser, so the tests reach the API directly and skip it.
+login:
+  enabled: false
 
 zitadel:
   masterkey: x123456789012345678901234567891y

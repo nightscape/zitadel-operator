@@ -1,3 +1,4 @@
+pub mod action_handler;
 pub mod application;
 pub mod email_provider_smtp;
 pub mod human_user;

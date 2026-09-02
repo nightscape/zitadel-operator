@@ -41,6 +41,9 @@ pub enum Error {
 
     #[error("Zitadel error: {0:?}")]
     ZitadelError(#[from] tonic::Status),
+
+    #[error("HTTP error: {0:?}")]
+    HttpError(#[from] reqwest::Error),
 }
 impl From<Box<dyn std::error::Error>> for Error {
     fn from(e: Box<dyn std::error::Error>) -> Self {
@@ -248,6 +251,33 @@ pub struct CustomHeaderInterceptor {
     inner: Arc<CustomHeaderInterceptorInner>,
 }
 
+impl CustomHeaderInterceptor {
+    async fn access_token(&self) -> std::result::Result<String, String> {
+        {
+            let guard = self.inner.state.read().unwrap();
+            if let Some(state) = guard.deref() {
+                if state.expiry > time::OffsetDateTime::now_utc() {
+                    return Ok(state.token.clone());
+                }
+            }
+        }
+
+        let token = authenticate_sa(
+            &self.inner.sa_data,
+            &self.inner.audience,
+            &self.inner.auth_options,
+            &self.inner.custom_headers,
+        )
+        .await?;
+
+        *self.inner.state.write().unwrap() = Some(TokenState {
+            token: token.clone(),
+            expiry: time::OffsetDateTime::now_utc() + time::Duration::minutes(59),
+        });
+        Ok(token)
+    }
+}
+
 impl Interceptor for CustomHeaderInterceptor {
     fn call(
         &mut self,
@@ -360,6 +390,13 @@ impl ZitadelBuilder {
     pub fn builder(&self) -> ClientBuilder<CustomHeaderInterceptor> {
         ClientBuilder::new(&self.url).with_interceptor(self.interceptor.clone())
     }
+
+    /// Bearer token for the parts of Zitadel the `zitadel` crate generates no
+    /// gRPC client for. Shares the interceptor's cache, so a REST call costs no
+    /// extra token request.
+    pub async fn access_token(&self) -> std::result::Result<String, String> {
+        self.interceptor.access_token().await
+    }
 }
 
 #[derive(Clone)]
@@ -368,6 +405,7 @@ pub struct OperatorContext {
     pub zitadel: ZitadelBuilder,
     pub operator_user_id: String,
     pub custom_headers: HashMap<String, String>,
+    pub signing_keys: actions::SigningKeys,
 }
 impl OperatorContext {
     pub fn build_recorder(&self) -> Recorder {
@@ -381,6 +419,7 @@ impl OperatorContext {
     }
 }
 
+pub mod actions;
 pub mod controllers;
 pub mod schema;
 pub(crate) mod util;

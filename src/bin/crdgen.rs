@@ -1,6 +1,6 @@
 use kube::CustomResourceExt;
 use zitadel_operator::schema::{
-    Application, EmailProviderSmtp, HumanUser, IdentityProvider, MachineUser, Organization,
+    ActionHandler, Application, EmailProviderSmtp, HumanUser, IdentityProvider, MachineUser, Organization,
     Project, ProjectRole, UserGrant,
 };
 
@@ -14,4 +14,5 @@ fn main() {
     println!("---\n{}", serde_yaml::to_string(&MachineUser::crd()).unwrap());
     println!("---\n{}", serde_yaml::to_string(&EmailProviderSmtp::crd()).unwrap());
     println!("---\n{}", serde_yaml::to_string(&IdentityProvider::crd()).unwrap());
+    println!("---\n{}", serde_yaml::to_string(&ActionHandler::crd()).unwrap());
 }

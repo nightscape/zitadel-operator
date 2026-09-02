@@ -1,3 +1,4 @@
+mod action_handler;
 mod application;
 mod email_provider_smtp;
 mod human_user;
@@ -8,6 +9,7 @@ mod project;
 mod project_role;
 mod user_grant;
 
+pub use action_handler::*;
 pub use application::*;
 pub use email_provider_smtp::*;
 pub use human_user::*;
