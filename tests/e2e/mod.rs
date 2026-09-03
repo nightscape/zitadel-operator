@@ -282,19 +282,49 @@ impl TestFixture {
         let mut admin = self.zitadel_builder.builder().build_admin_client().await
             .map_err(|e| anyhow!("Failed to build admin client: {:?}", e))?;
 
-        let orgs = org_client.list_organizations(ListOrganizationsRequest {
-            queries: vec![],
-            query: None,
-            sorting_column: OrganizationFieldName::Unspecified as i32,
-        }).await?.into_inner();
+        // ListOrganizations reads a projection that trails the remove command, so an
+        // org stays listed for a while after remove_org returns. Leaving before the
+        // list is empty hands the leftovers to the next test case.
+        let mut requested: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let started = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let orgs = org_client.list_organizations(ListOrganizationsRequest {
+                    queries: vec![],
+                    query: None,
+                    sorting_column: OrganizationFieldName::Unspecified as i32,
+                }).await?.into_inner();
 
-        for org in orgs.result {
-            if org.name == "ZITADEL" || org.name == "E2E" {
-                continue;
+                let test_orgs: Vec<_> = orgs.result.into_iter()
+                    .filter(|o| o.name != "ZITADEL" && o.name != "E2E")
+                    .collect();
+                if test_orgs.is_empty() {
+                    return Ok::<_, anyhow::Error>(());
+                }
+
+                for org in test_orgs {
+                    if !requested.insert(org.id.clone()) {
+                        continue;
+                    }
+                    info!("Deleting Zitadel-direct org: {} ({})", org.name, org.id);
+                    match admin.remove_org(RemoveOrgRequest { org_id: org.id }).await {
+                        Ok(_) => {}
+                        // The projection also lags the removals an Organization
+                        // finalizer already made.
+                        Err(status) if status.code() == tonic::Code::NotFound => {}
+                        Err(status) => {
+                            return Err(anyhow!("remove_org failed for {}: {status}", org.name))
+                        }
+                    }
+                }
+
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            info!("Deleting Zitadel-direct org: {} ({})", org.name, org.id);
-            let _ = admin.remove_org(RemoveOrgRequest { org_id: org.id }).await;
-        }
+        })
+        .await
+        .context("Zitadel still lists test orgs")??;
+
+        info!("Zitadel org list empty after {:?}", started.elapsed());
         Ok(())
     }
 }
