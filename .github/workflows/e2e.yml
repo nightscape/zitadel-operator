@@ -57,6 +57,10 @@ jobs:
         if: always()
         run: cargo test --test e2e_actions -- --nocapture 2>&1 | tee -a e2e-output.log
 
+      - name: Run identity provider e2e tests
+        if: always()
+        run: cargo test --test e2e_identity_provider -- --nocapture 2>&1 | tee -a e2e-output.log
+
       - name: Upload test output
         if: always()
         uses: actions/upload-artifact@v4

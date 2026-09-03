@@ -26,14 +26,16 @@ use std::{sync::Arc, time::Duration};
 use tonic::{service::interceptor::InterceptedService, Code};
 use tracing::{debug, info, instrument, warn};
 use zitadel::api::zitadel::{
+    admin::v1::GetLoginPolicyRequest,
     idp::v1::{
         idp::Config as IdpConfig, Idp, IdpFieldName, IdpNameQuery, IdpOwnerType, IdpStylingType,
     },
     management::v1::{
-        idp_query, management_service_client::ManagementServiceClient, AddIdpToLoginPolicyRequest,
-        AddOrgJwtidpRequest, GetOrgIdpByIdRequest, IdpQuery, ListLoginPolicyIdPsRequest,
-        ListOrgIdPsRequest, RemoveIdpFromLoginPolicyRequest, RemoveOrgIdpRequest,
-        UpdateOrgIdpRequest, UpdateOrgIdpjwtConfigRequest,
+        add_custom_login_policy_request, idp_query,
+        management_service_client::ManagementServiceClient, AddCustomLoginPolicyRequest,
+        AddIdpToLoginPolicyRequest, AddOrgJwtidpRequest, GetOrgIdpByIdRequest, IdpQuery,
+        ListLoginPolicyIdPsRequest, ListOrgIdPsRequest, RemoveIdpFromLoginPolicyRequest,
+        RemoveOrgIdpRequest, UpdateOrgIdpRequest, UpdateOrgIdpjwtConfigRequest,
     },
     v1::TextQueryMethod,
 };
@@ -58,14 +60,91 @@ fn matches_spec(object: &Idp, idp: &IdentityProvider) -> bool {
 type Management =
     ManagementServiceClient<InterceptedService<tonic::transport::Channel, CustomHeaderInterceptor>>;
 
+/// Give the organization a login policy of its own, copied from the instance
+/// default.
+///
+/// A provider can only be attached to a policy the organization owns. The copy
+/// leaves the organization's login behaviour unchanged at this moment, but the
+/// organization stops following later edits to the instance default.
+async fn copy_instance_login_policy(
+    ctx: &OperatorContext,
+    management: &mut Management,
+    org_id: &str,
+) -> Result<()> {
+    let mut admin = ctx.zitadel.builder().build_admin_client().await?;
+    let default = admin
+        .get_login_policy(GetLoginPolicyRequest {})
+        .await?
+        .into_inner()
+        .policy
+        .ok_or_else(|| Error::Other("the instance has no default login policy".to_string()))?;
+
+    let created = management
+        .add_custom_login_policy(create_request_with_org_id(
+            AddCustomLoginPolicyRequest {
+                allow_username_password: default.allow_username_password,
+                allow_register: default.allow_register,
+                allow_external_idp: default.allow_external_idp,
+                force_mfa: default.force_mfa,
+                force_mfa_local_only: default.force_mfa_local_only,
+                passwordless_type: default.passwordless_type,
+                hide_password_reset: default.hide_password_reset,
+                ignore_unknown_usernames: default.ignore_unknown_usernames,
+                allow_domain_discovery: default.allow_domain_discovery,
+                disable_login_with_email: default.disable_login_with_email,
+                disable_login_with_phone: default.disable_login_with_phone,
+                default_redirect_uri: default.default_redirect_uri,
+                password_check_lifetime: default.password_check_lifetime,
+                external_login_check_lifetime: default.external_login_check_lifetime,
+                mfa_init_skip_lifetime: default.mfa_init_skip_lifetime,
+                second_factor_check_lifetime: default.second_factor_check_lifetime,
+                multi_factor_check_lifetime: default.multi_factor_check_lifetime,
+                second_factors: default.second_factors,
+                multi_factors: default.multi_factors,
+                // Every provider the default policy offers is instance-owned,
+                // and the organization would lose it by owning a policy.
+                idps: default
+                    .idps
+                    .into_iter()
+                    .map(|link| add_custom_login_policy_request::Idp {
+                        idp_id: link.idp_id,
+                        owner_type: IdpOwnerType::System.into(),
+                    })
+                    .collect(),
+            },
+            org_id.to_string(),
+        ))
+        .await;
+
+    match created {
+        // Reached when a concurrent reconcile for another provider of the same
+        // organization created the policy first.
+        Err(e) if e.code() == Code::AlreadyExists => Ok(()),
+        other => other.map(|_| ()).map_err(Error::from),
+    }
+}
+
+async fn add_to_login_policy(
+    management: &mut Management,
+    idp_id: &str,
+    org_id: &str,
+) -> std::result::Result<(), tonic::Status> {
+    management
+        .add_idp_to_login_policy(create_request_with_org_id(
+            AddIdpToLoginPolicyRequest {
+                idp_id: idp_id.to_string(),
+                owner_type: IdpOwnerType::Org.into(),
+            },
+            org_id.to_string(),
+        ))
+        .await
+        .map(|_| ())
+}
+
 /// Membership of the organization's login policy, which is what actually makes
 /// a provider appear on the login screen.
-///
-/// Zitadel refuses this write for an organization still inheriting the instance
-/// default policy. Creating a custom one to get past that would silently take
-/// over every other login setting for the organization, so the operator reports
-/// the situation instead and leaves the choice with whoever owns the tenant.
 async fn reconcile_login_screen(
+    ctx: &OperatorContext,
     management: &mut Management,
     recorder: &Recorder,
     idp: &IdentityProvider,
@@ -87,16 +166,7 @@ async fn reconcile_login_screen(
     }
 
     let resp = if idp.spec.show_on_login_screen {
-        management
-            .add_idp_to_login_policy(create_request_with_org_id(
-                AddIdpToLoginPolicyRequest {
-                    idp_id: idp_id.to_string(),
-                    owner_type: IdpOwnerType::Org.into(),
-                },
-                org_id.to_string(),
-            ))
-            .await
-            .map(|_| ())
+        add_to_login_policy(management, idp_id, org_id).await
     } else {
         management
             .remove_idp_from_login_policy(create_request_with_org_id(
@@ -107,6 +177,61 @@ async fn reconcile_login_screen(
             ))
             .await
             .map(|_| ())
+    };
+
+    // Org-Ffgw2 is Zitadel's "this organization has no login policy of its own",
+    // the state every organization starts in.
+    let inherits =
+        |e: &tonic::Status| e.code() == Code::NotFound && e.message().contains("Org-Ffgw2");
+
+    let resp = match resp {
+        // Reached when the organization's policy is removed between the listing
+        // above and this call. Nothing to withdraw from: an organization without
+        // a policy of its own offers no provider, which is the asked-for state.
+        Err(e) if !idp.spec.show_on_login_screen && inherits(&e) => {
+            debug!(
+                "organization {} has no login policy of its own, so the provider was not offered \
+                 anyway",
+                idp.spec.organization_name
+            );
+            return Ok(());
+        }
+        // The organization keeps the policy once it has one: withdrawing the
+        // provider later must not send it back to inheriting, which would
+        // change how it logs users in.
+        Err(e) if idp.spec.show_on_login_screen && inherits(&e) => {
+            if let Err(e) = copy_instance_login_policy(ctx, management, org_id).await {
+                let note = format!(
+                    "Organization {} inherits the instance default login policy, and giving it a \
+                     custom copy of that policy failed, so the provider cannot be offered on its \
+                     login screen: {e}",
+                    idp.spec.organization_name
+                );
+                warn!("{note}");
+                recorder
+                    .publish(
+                        &Event {
+                            type_: EventType::Warning,
+                            reason: "NoCustomLoginPolicy".to_string(),
+                            note: Some(note.clone()),
+                            action: "NotOffered".to_string(),
+                            secondary: None,
+                        },
+                        &idp.object_ref(&()),
+                    )
+                    .await?;
+                return Err(Error::Other(note));
+            }
+
+            info!(
+                "organization {} had no login policy of its own; created one copied from the \
+                 instance default",
+                idp.spec.organization_name
+            );
+
+            add_to_login_policy(management, idp_id, org_id).await
+        }
+        other => other,
     };
 
     match resp {
@@ -130,30 +255,6 @@ async fn reconcile_login_screen(
                 )
                 .await?;
             Ok(())
-        }
-        // Org-Ffgw2 is Zitadel's "this organization has no login policy of its
-        // own", the state every organization starts in.
-        Err(e) if e.code() == Code::NotFound && e.message().contains("Org-Ffgw2") => {
-            let note = format!(
-                "Organization {} inherits the instance default login policy, so the provider \
-                 cannot be offered on its login screen. Give the organization a custom login \
-                 policy, or set showOnLoginScreen: false.",
-                idp.spec.organization_name
-            );
-            warn!("{note}");
-            recorder
-                .publish(
-                    &Event {
-                        type_: EventType::Warning,
-                        reason: "NoCustomLoginPolicy".to_string(),
-                        note: Some(note.clone()),
-                        action: "NotOffered".to_string(),
-                        secondary: None,
-                    },
-                    &idp.object_ref(&()),
-                )
-                .await?;
-            Err(Error::Other(note))
         }
         Err(e) => Err(Error::ZitadelError(e)),
     }
@@ -399,7 +500,7 @@ async fn reconcile(idp: Arc<IdentityProvider>, ctx: Arc<OperatorContext>) -> Res
                 };
 
                 if let Some((idp_id, org_id)) = ensured {
-                    reconcile_login_screen(&mut management, &recorder, &idp, &idp_id, &org_id).await?;
+                    reconcile_login_screen(&ctx, &mut management, &recorder, &idp, &idp_id, &org_id).await?;
                 }
 
                 Ok(Action::requeue(Duration::from_secs(requeue_secs())))

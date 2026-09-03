@@ -27,7 +27,10 @@ use zitadel::api::zitadel::user::v1::AccessTokenType;
 use zitadel::credentials::{AuthenticationOptions, ServiceAccount};
 use zitadel_operator::{
     controllers::{application, human_user, organization, project, project_role, user_grant},
-    schema::{ActionHandler, Application, HumanUser, Organization, Project, ProjectRole, UserGrant},
+    schema::{
+        ActionHandler, Application, HumanUser, IdentityProvider, Organization, Project, ProjectRole,
+        UserGrant,
+    },
     OperatorContext, ZitadelBuilder,
 };
 
@@ -555,6 +558,7 @@ async fn apply_crds(client: &Client) -> Result<()> {
         UserGrant::crd(),
         Application::crd(),
         ActionHandler::crd(),
+        IdentityProvider::crd(),
     ];
 
     for crd in &crd_list {
@@ -660,6 +664,7 @@ async fn wait_for_crd_storage_ready(client: &Client) -> Result<()> {
     let users: Api<HumanUser> = Api::namespaced(client.clone(), "default");
     let grants: Api<UserGrant> = Api::namespaced(client.clone(), "default");
     let apps: Api<Application> = Api::namespaced(client.clone(), "default");
+    let idps: Api<IdentityProvider> = Api::namespaced(client.clone(), "default");
 
     let lp = ListParams::default().limit(1);
 
@@ -672,6 +677,7 @@ async fn wait_for_crd_storage_ready(client: &Client) -> Result<()> {
                 users.list(&lp),
                 grants.list(&lp),
                 apps.list(&lp),
+                idps.list(&lp),
             );
 
             if results.0.is_ok()
@@ -680,6 +686,7 @@ async fn wait_for_crd_storage_ready(client: &Client) -> Result<()> {
                 && results.3.is_ok()
                 && results.4.is_ok()
                 && results.5.is_ok()
+                && results.6.is_ok()
             {
                 info!("All CRD storage ready");
                 return Ok::<_, anyhow::Error>(());
