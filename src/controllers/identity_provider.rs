@@ -1,7 +1,7 @@
 use crate::{
     schema::{
-        IdentityProvider, IdentityProviderAzureAdSpec, IdentityProviderInnerSpec, IdentityProviderJwtSpec,
-        IdentityProviderPhase, IdentityProviderStatus, Organization,
+        IdentityProvider, IdentityProviderAutoLinking, IdentityProviderAzureAdSpec, IdentityProviderInnerSpec,
+        IdentityProviderJwtSpec, IdentityProviderPhase, IdentityProviderStatus, Organization,
     },
     util::{
         create_request_with_org_id, patch_status, requeue_secs, CurrentState, CurrentStateParameters,
@@ -108,15 +108,18 @@ fn pinned_tenant(tenant_id: &str) -> AzureAdTenant {
     }
 }
 
-/// Zitadel's console defaults for an Azure AD provider, with `autoRegister`
-/// carried over from the spec the same way the jwt variant does it.
-fn provider_options(auto_register: bool) -> Options {
+fn provider_options(auto_register: bool, azure: &IdentityProviderAzureAdSpec) -> Options {
     Options {
         is_linking_allowed: true,
         is_creation_allowed: true,
         is_auto_creation: auto_register,
-        is_auto_update: true,
-        auto_linking: AutoLinkingOption::Unspecified.into(),
+        is_auto_update: azure.auto_update,
+        auto_linking: match azure.auto_linking {
+            IdentityProviderAutoLinking::Unspecified => AutoLinkingOption::Unspecified,
+            IdentityProviderAutoLinking::Username => AutoLinkingOption::Username,
+            IdentityProviderAutoLinking::Email => AutoLinkingOption::Email,
+        }
+        .into(),
     }
 }
 
@@ -137,7 +140,7 @@ fn azure_ad_matches_spec(object: &Provider, idp: &IdentityProvider) -> bool {
         return false;
     };
     object.name == idp.spec.name
-        && config.options == Some(provider_options(idp.spec.auto_register))
+        && config.options == Some(provider_options(idp.spec.auto_register, azure))
         && azure_config.client_id == azure.client_id
         && azure_config.tenant == Some(pinned_tenant(&azure.tenant_id))
         && azure_config.email_verified == azure.email_verified
@@ -861,7 +864,7 @@ async fn reconcile_azure_ad(
                         tenant: Some(pinned_tenant(&azure.tenant_id)),
                         email_verified: azure.email_verified,
                         scopes: vec![],
-                        provider_options: Some(provider_options(idp.spec.auto_register)),
+                        provider_options: Some(provider_options(idp.spec.auto_register, azure)),
                     },
                     org.id.clone(),
                 ))
@@ -901,7 +904,7 @@ async fn reconcile_azure_ad(
                         tenant: Some(pinned_tenant(&azure.tenant_id)),
                         email_verified: azure.email_verified,
                         scopes: vec![],
-                        provider_options: Some(provider_options(idp.spec.auto_register)),
+                        provider_options: Some(provider_options(idp.spec.auto_register, azure)),
                     },
                     org.id.clone(),
                 ))
@@ -1197,6 +1200,8 @@ mod tests {
                     key: "client-secret".to_string(),
                 },
                 email_verified: true,
+                auto_linking: IdentityProviderAutoLinking::Unspecified,
+                auto_update: true,
             }),
         };
         IdentityProvider::new("legal-entra-idp", spec)
@@ -1212,7 +1217,7 @@ mod tests {
             owner: IdpOwnerType::Org.into(),
             r#type: ProviderType::AzureAd.into(),
             config: Some(Config {
-                options: Some(provider_options(idp.spec.auto_register)),
+                options: Some(provider_options(idp.spec.auto_register, azure)),
                 config: Some(ProviderConfig::AzureAd(AzureAdConfig {
                     client_id: azure.client_id.clone(),
                     tenant: Some(pinned_tenant(&azure.tenant_id)),
@@ -1334,10 +1339,12 @@ mod tests {
 
     #[test]
     fn auto_register_drives_auto_creation_only() {
-        assert!(provider_options(true).is_auto_creation);
-        assert!(!provider_options(false).is_auto_creation);
+        let idp = azure_cr();
+        let azure = azure_ad_spec(&idp);
+        assert!(provider_options(true, azure).is_auto_creation);
+        assert!(!provider_options(false, azure).is_auto_creation);
         for auto_register in [true, false] {
-            let options = provider_options(auto_register);
+            let options = provider_options(auto_register, azure);
             assert!(options.is_auto_update, "Entra stays the source of truth for profiles");
             assert!(options.is_linking_allowed);
             assert!(options.is_creation_allowed);
@@ -1350,9 +1357,67 @@ mod tests {
     }
 
     #[test]
+    fn declared_azure_provider_options_reach_the_sdk_for_every_combination() {
+        for auto_register in [false, true] {
+            for (auto_linking, expected_linking) in [
+                (IdentityProviderAutoLinking::Unspecified, AutoLinkingOption::Unspecified),
+                (IdentityProviderAutoLinking::Username, AutoLinkingOption::Username),
+                (IdentityProviderAutoLinking::Email, AutoLinkingOption::Email),
+            ] {
+                for auto_update in [false, true] {
+                    let mut idp = azure_cr();
+                    idp.spec.auto_register = auto_register;
+                    let azure = match &mut idp.spec.inner {
+                        IdentityProviderInnerSpec::AzureAd(azure) => azure,
+                        other => panic!("parsed as {other:?}"),
+                    };
+                    azure.auto_linking = auto_linking;
+                    azure.auto_update = auto_update;
+
+                    let options = provider_options(auto_register, azure);
+                    assert_eq!(options.is_auto_creation, auto_register);
+                    assert_eq!(options.is_auto_update, auto_update);
+                    assert_eq!(options.auto_linking, i32::from(expected_linking));
+                    assert!(options.is_linking_allowed);
+                    assert!(options.is_creation_allowed);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_provider_built_from_the_spec_matches_it() {
         let idp = azure_cr();
         assert!(azure_ad_matches_spec(&provider_from(&idp), &idp));
+    }
+
+    #[test]
+    fn non_default_azure_options_match_only_the_declared_values() {
+        let mut idp = azure_cr();
+        let azure = match &mut idp.spec.inner {
+            IdentityProviderInnerSpec::AzureAd(azure) => azure,
+            other => panic!("parsed as {other:?}"),
+        };
+        azure.auto_linking = IdentityProviderAutoLinking::Email;
+        azure.auto_update = false;
+
+        let expected = provider_from(&idp);
+        assert!(azure_ad_matches_spec(&expected, &idp));
+
+        for actual_options in [
+            Options {
+                auto_linking: AutoLinkingOption::Username.into(),
+                ..provider_options(idp.spec.auto_register, azure_ad_spec(&idp))
+            },
+            Options {
+                is_auto_update: true,
+                ..provider_options(idp.spec.auto_register, azure_ad_spec(&idp))
+            },
+        ] {
+            let mut changed = expected.clone();
+            changed.config.as_mut().unwrap().options = Some(actual_options);
+            assert!(!azure_ad_matches_spec(&changed, &idp), "{actual_options:?} is drift");
+        }
     }
 
     #[test]
@@ -1383,7 +1448,7 @@ mod tests {
         assert!(!azure_ad_matches_spec(&unverified, &idp), "emailVerified");
 
         let mut no_auto_register = provider_from(&idp);
-        no_auto_register.config.as_mut().unwrap().options = Some(provider_options(false));
+        no_auto_register.config.as_mut().unwrap().options = Some(provider_options(false, azure_ad_spec(&idp)));
         assert!(!azure_ad_matches_spec(&no_auto_register, &idp), "autoRegister");
 
         let mut scoped = provider_from(&idp);
@@ -1400,7 +1465,7 @@ mod tests {
     #[test]
     fn an_option_changed_in_the_console_counts_as_drift() {
         let idp = azure_cr();
-        let base = provider_options(idp.spec.auto_register);
+        let base = provider_options(idp.spec.auto_register, azure_ad_spec(&idp));
 
         let mut edits = vec![];
         for flip in [
@@ -1517,6 +1582,94 @@ mod tests {
             serde_json::from_value::<IdentityProviderSpec>(value)
                 .expect_err(&format!("clientSecretRef.{missing} must be required"));
         }
+    }
+
+    #[test]
+    fn azure_provider_linking_options_default_round_trip_and_reject_invalid_values() {
+        let defaults = azure_ad_spec_from(complete_azure_ad());
+        let default_idp = IdentityProvider::new("defaults", defaults.clone());
+        let default_azure = azure_ad_spec(&default_idp);
+        assert_eq!(default_azure.auto_linking, IdentityProviderAutoLinking::Unspecified);
+        assert!(default_azure.auto_update);
+
+        for (linking, expected) in [
+            ("Unspecified", IdentityProviderAutoLinking::Unspecified),
+            ("Username", IdentityProviderAutoLinking::Username),
+            ("Email", IdentityProviderAutoLinking::Email),
+        ] {
+            let mut value = complete_azure_ad();
+            value["autoLinking"] = serde_json::json!(linking);
+            value["autoUpdate"] = serde_json::json!(false);
+            let spec = azure_ad_spec_from(value);
+            let configured_idp = IdentityProvider::new("configured", spec.clone());
+            let azure = azure_ad_spec(&configured_idp);
+            assert_eq!(azure.auto_linking, expected);
+            assert!(!azure.auto_update);
+            let round_trip = serde_json::to_value(spec).unwrap();
+            assert_eq!(round_trip["azureAd"]["autoLinking"], linking);
+            assert_eq!(round_trip["azureAd"]["autoUpdate"], false);
+        }
+
+        for invalid in [
+            serde_json::json!("email"),
+            serde_json::json!("EMAIL"),
+            serde_json::json!(false),
+            serde_json::json!(null),
+        ] {
+            let mut value = complete_azure_ad();
+            value["autoLinking"] = invalid;
+            serde_json::from_value::<IdentityProviderSpec>(serde_json::json!({
+                "name": "Microsoft",
+                "organizationName": "legal",
+                "azureAd": value,
+            }))
+            .expect_err("invalid autoLinking must be rejected");
+        }
+
+        for invalid in [
+            serde_json::json!("false"),
+            serde_json::json!(0),
+            serde_json::json!(null),
+        ] {
+            let mut value = complete_azure_ad();
+            value["autoUpdate"] = invalid;
+            serde_json::from_value::<IdentityProviderSpec>(serde_json::json!({
+                "name": "Microsoft",
+                "organizationName": "legal",
+                "azureAd": value,
+            }))
+            .expect_err("invalid autoUpdate must be rejected");
+        }
+    }
+
+    #[test]
+    fn identity_provider_crd_exposes_typed_defaulted_azure_options() {
+        let crd = serde_json::to_value(IdentityProvider::crd()).unwrap();
+        let properties = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]
+            ["azureAd"]["properties"];
+        let azure_required = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["azureAd"]["required"];
+        let jwt_properties = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["jwt"]["properties"];
+
+        assert_eq!(properties["autoUpdate"]["type"], "boolean");
+        assert_eq!(properties["autoUpdate"]["default"], true);
+        assert_eq!(properties["autoLinking"]["type"], "string");
+        assert_eq!(properties["autoLinking"]["default"], "Unspecified");
+        assert_eq!(
+            properties["autoLinking"]["enum"],
+            serde_json::json!(["Unspecified", "Username", "Email"])
+        );
+        assert!(
+            !azure_required
+                .as_array()
+                .expect("azureAd has a required list")
+                .iter()
+                .any(|field| field == "autoLinking" || field == "autoUpdate"),
+            "defaulted Azure options must remain optional"
+        );
+        assert!(jwt_properties.get("autoLinking").is_none());
+        assert!(jwt_properties.get("autoUpdate").is_none());
     }
 
     /// The selector carries no namespace: one would let whoever may create an

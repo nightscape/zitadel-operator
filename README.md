@@ -32,6 +32,23 @@ identity management into your cloud-native workflows.
 
 * [Action handlers](docs/action-handlers.md) — hooking into ZITADEL Actions v2
 
+## Entra identity providers
+
+An `azureAd` IdentityProvider can select automatic linking for an existing account
+at the first Entra sign-in and whether later Entra sign-ins update its profile:
+
+```yaml
+spec:
+  azureAd:
+    autoLinking: Email
+    autoUpdate: false
+```
+
+The defaults are `autoLinking: Unspecified` and `autoUpdate: true`. Enabling
+email linking trusts the email claim from the configured Entra directory. Turning
+it off later does not remove links that already exist. Before rolling back to an
+older operator, restore the defaults and verify the provider readback.
+
 ## Getting Started (Development)
 
 1. Clone this repository

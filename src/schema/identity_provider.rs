@@ -90,6 +90,21 @@ pub(crate) struct IdentityProviderAzureAdSpec {
     /// Trust the `email` claim Entra sends without asking the user to verify it
     #[serde(default)]
     pub email_verified: bool,
+    /// Match an existing user during first sign-in using the selected Entra claim.
+    #[serde(default)]
+    pub auto_linking: IdentityProviderAutoLinking,
+    /// Keep profile fields in sync with later Entra sign-ins.
+    #[serde(default = "yes")]
+    pub auto_update: bool,
+}
+
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase")]
+pub(crate) enum IdentityProviderAutoLinking {
+    #[default]
+    Unspecified,
+    Username,
+    Email,
 }
 
 /// Reference to a Secret in the IdentityProvider's own namespace. Carrying a
